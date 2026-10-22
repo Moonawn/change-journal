@@ -461,6 +461,23 @@ def _semantic_marker(root: Path, event: Dict[str, Any]) -> None:
         _atomic_write(marker_path, payload)
 
 
+def _hook_turn_id(root: Path, session: str, host: str, profile: str) -> str:
+    """Resolve this exact shell call, never a session's most recent turn."""
+    try:
+        tool_id = safe_id(os.environ.get("CODEX_TOOL_CALL_ID"), "tool_use_id")
+        if not session or not tool_id:
+            return ""
+        path = root / ".spool" / "codex-context" / session / f"{tool_id}.json"
+        context = json.loads(path.read_text(encoding="utf-8"))
+        if any(context.get(k, "") != v for k, v in (
+                ("session_id", session), ("tool_use_id", tool_id),
+                ("host_id", host), ("profile_id", profile))):
+            return ""
+        return safe_id(context.get("turn_id"), "turn_id")
+    except (OSError, ValueError, TypeError, AttributeError):
+        return ""
+
+
 def record_event(
     root: Path,
     *,
@@ -573,6 +590,8 @@ def record_event(
     effective_turn = safe_id(turn_id or os.environ.get("CODEX_TURN_ID"), "turn_id")
     effective_host = safe_id(host_id or socket.gethostname(), "host_id")
     effective_profile = safe_id(profile_id, "profile_id") if profile_id else ""
+    if source == "semantic" and not effective_turn:
+        effective_turn = _hook_turn_id(root, effective_session, effective_host, effective_profile)
     if scope_id:
         effective_scope = safe_id(scope_id, "scope_id")
     else:

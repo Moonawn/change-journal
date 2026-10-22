@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Privacy-preserving Codex PostToolUse/Stop adapter for change-journal."""
+"""Privacy-preserving Codex context/PostToolUse/Stop adapter for change-journal."""
 
 from __future__ import annotations
 
@@ -134,7 +134,31 @@ def _turn_dir(root: Path, session: str, turn: str) -> Path:
     return root / ".spool" / "codex" / session / turn
 
 
+def capture_context(payload: Dict[str, Any], root: Path) -> None:
+    # PreToolUse runs before the shell, when its real turn is already known.
+    if payload.get("tool_name") != "Bash" or "change_journal.py" not in _payload_command(payload):
+        return
+    session, turn = _safe_hook_ids(payload)
+    tool_id = cj.safe_id(payload.get("tool_use_id"), "tool_use_id")
+    if not tool_id:
+        return
+    context = {
+        "session_id": session, "turn_id": turn, "tool_use_id": tool_id,
+        "host_id": cj.safe_id(payload.get("host_id") or socket.gethostname(), "host_id"),
+        "profile_id": cj.safe_id(payload.get("profile_id"), "profile_id"),
+    }
+    cj._atomic_write(root / ".spool" / "codex-context" / session / f"{tool_id}.json", cj._json_bytes(context))
+
+
+def _clear_context(payload: Dict[str, Any], root: Path) -> None:
+    session = cj.safe_id(payload.get("session_id"), "session_id")
+    tool_id = cj.safe_id(payload.get("tool_use_id"), "tool_use_id")
+    if session and tool_id:
+        (root / ".spool" / "codex-context" / session / f"{tool_id}.json").unlink(missing_ok=True)
+
+
 def observe(payload: Dict[str, Any], root: Path) -> None:
+    _clear_context(payload, root)
     tool_name, _ = cj.safe_text(str(payload.get("tool_name") or ""), "tool_name", 160)
     if not tool_name:
         return
@@ -323,13 +347,15 @@ def _record_safe_error(root: Path, mode: str, exc: BaseException) -> None:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("observe", "stop"))
+    parser.add_argument("mode", choices=("context", "observe", "stop"))
     parser.add_argument("--root")
     args = parser.parse_args(argv)
     root = cj.root_from(args.root)
     try:
         payload = _read_payload()
-        if args.mode == "observe":
+        if args.mode == "context":
+            capture_context(payload, root)
+        elif args.mode == "observe":
             observe(payload, root)
         else:
             finalize(payload, root)

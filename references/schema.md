@@ -89,7 +89,27 @@
 
 Hermes 继续通过 `scripts/hermes_adapter.py` 写同一台账。必须提供 `profile_id` 和稳定的 `external_event_id`；二者构成幂等键。可传基础字段及 `record_level/kind/primary_path/work_id/work_title/follow_ups/limitations/resolves_event_ids/supersedes_event_ids/lesson_key/lesson_trigger/lesson_check/lesson_status`，各列表字段必须是数组。旧调用仍可用；旧 unresolved 只作为待核线索。
 
-Hook 兼容读取 1.0/1.1/1.2 的安全 spool；只记录可能的变化、路径和工具结果，不能当作已验证成果。启用 Hook 的宿主接入应向观察与语义记录传递相同的真实 `session_id/turn_id`，可用参数或 `CODEX_SESSION_ID`（也接受 `CODEX_THREAD_ID`）与 `CODEX_TURN_ID` 环境变量；普通手工记录无需填写。匹配还核对 host、profile、cwd、精确文件路径及记录先后，不从同一目录或相近时间推测轮次。不同 host/profile/cwd 的兜底分别保存；部分文件已覆盖时，只保留其余文件的观察。
+Hook 兼容读取 1.0/1.1/1.2 的安全 spool；只记录可能的变化、路径和工具结果，不能当作已验证成果。Codex Hook payload 提供真实 `session_id/turn_id/tool_use_id`；普通 shell 不一定有 `CODEX_TURN_ID`。`context` 在记账命令执行前保存最小身份关联，`record` 通过当前 `CODEX_TOOL_CALL_ID` 精确读取，PostToolUse 随即清理；不会取会话的“最近一轮”。显式参数或 `CODEX_SESSION_ID`（也接受 `CODEX_THREAD_ID`）与 `CODEX_TURN_ID` 仍可使用，普通手工记录无需填写。
+
+接入现有 `hooks.json` 时合并以下三个处理器，替换脚本绝对路径并保留已有 Hook；通过 Codex `/hooks` 审阅并信任。未信任的用户 Hook 会被跳过，详见 [Codex Hooks](https://learn.chatgpt.com/docs/hooks)。Hook 与记账命令使用同一个台账根目录（默认、`CHANGE_JOURNAL_ROOT` 或显式 `--root`）。
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [{"matcher": "Bash", "hooks": [
+      {"type": "command", "command": "python3 /absolute/change-journal/scripts/codex_hook.py context", "timeout": 1}
+    ]}],
+    "PostToolUse": [{"matcher": "Bash|apply_patch|functions\\.exec|functions\\.apply_patch|.*(?:write_file|edit_file|create_file|delete_file|move_file|rename_file)$", "hooks": [
+      {"type": "command", "command": "python3 /absolute/change-journal/scripts/codex_hook.py observe", "timeout": 1}
+    ]}],
+    "Stop": [{"hooks": [
+      {"type": "command", "command": "python3 /absolute/change-journal/scripts/codex_hook.py stop", "timeout": 2}
+    ]}]
+  }
+}
+```
+
+匹配还核对 host、profile、cwd、精确文件路径及记录先后，不从同一目录或相近时间推测轮次。不同 host/profile/cwd 的兜底分别保存；部分文件已覆盖时，只保留其余文件的观察。接入后可运行 `CHANGE_JOURNAL_HOST_TEST=1 python3 -m unittest discover -s tests -p test_codex_host.py -v`：真实 Codex CLI 执行 Hook，模型响应来自本地确定性 fixture，临时台账隔离，覆盖完整/部分/无语义记录、重试及 code_mode 嵌套工具，不调用外部模型。
 
 缺少关联 ID、无法提取路径、语义记录早于观察或旧 spool 缺少身份信息时，保留机械兜底。宿主不提供轮次信息时仍可能看到两条线索，不能为去重而虚构轮次。Hook 是启发式观察器，不能覆盖所有 shell/自定义工具变更；安装 Skill 不自动接线，需按实际宿主 payload 验证。trace 不自动晋升为语义事件。
 
