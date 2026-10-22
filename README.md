@@ -89,10 +89,6 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 
 测试使用隔离临时目录，覆盖追加记录、幂等写入、对象路由、事项汇总、身份边界、待办关系、经验版本和归类失败时的事实保留。
 
-## 版权与许可
+## 版权
 
 Copyright (c) 2026 Moonawn。
-
-自 2026-10-22 起，本仓库不再将 MIT 作为后续内容的统一发行许可。对于尚未获得其他授权的新内容，保留所有权利；仓库公开本身不提供新的使用、修改或再分发许可。适用法律、GitHub 平台条款及已授予的许可所允许的权利不受此声明影响。
-
-历史版本 [`996666d`](https://github.com/Moonawn/change-journal/tree/996666d8fbd6682680068985021333c5ac4a0df7) 曾按 [MIT License](https://github.com/Moonawn/change-journal/blob/996666d8fbd6682680068985021333c5ac4a0df7/LICENSE) 发布。移除当前许可文件不撤回此前已授予的权利，已按 MIT 发布的代码仍可依原许可使用、修改和分发；其他权利人的内容继续适用其原有许可。
