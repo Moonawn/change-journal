@@ -165,22 +165,33 @@ def default_registry(root: Optional[Path] = None) -> Dict[str, Any]:
 
 
 def init_root(root: Path) -> Dict[str, Any]:
-    for relative in ("events", "views/by-scope", "views/daily", "idempotency", ".spool/semantic"):
-        (root / relative).mkdir(parents=True, exist_ok=True)
-    registry_path = root / "registry.json"
-    created = False
-    if not registry_path.exists():
-        _atomic_write(registry_path, _json_bytes(default_registry(root)), overwrite=False)
-        created = True
+    with journal_lock(root):
+        for relative in ("events", "views/by-scope", "views/daily", "idempotency", ".spool/semantic"):
+            (root / relative).mkdir(parents=True, exist_ok=True)
+        registry_path = root / "registry.json"
+        created = False
+        if not registry_path.exists():
+            _atomic_write(registry_path, _json_bytes(default_registry(root)), overwrite=False)
+            created = True
     return {"root": str(root), "registry_created": created}
 
 
 def load_registry(root: Path) -> Dict[str, Any]:
-    init_root(root)
     with (root / "registry.json").open("r", encoding="utf-8") as handle:
         registry = json.load(handle)
-    if not isinstance(registry.get("routes"), list):
+    if not isinstance(registry, dict) or not isinstance(registry.get("routes"), list):
         raise JournalError("registry routes must be a list")
+    scopes_by_path = {}
+    for item in registry["routes"]:
+        if not isinstance(item, dict):
+            raise JournalError("registry route must be an object")
+        path = safe_path(item.get("path"), "registry path")
+        scope = safe_id(item.get("scope_id"), "registry scope_id")
+        if not path or not scope:
+            raise JournalError("registry route needs path and scope_id")
+        if path in scopes_by_path and scopes_by_path[path] != scope:
+            raise JournalError(f"conflicting scopes for registry path: {path}")
+        scopes_by_path[path] = scope
     return registry
 
 
@@ -207,7 +218,11 @@ def route_scope(root: Path, cwd: str = "", changed_paths: Sequence[str] = (), pr
                 matches.append((len(prefix), scope_id))
     if not matches:
         return safe_id(registry.get("unknown_scope"), "unknown_scope", "UNASSIGNED")
-    return max(matches, key=lambda pair: pair[0])[1]
+    longest = max(length for length, _ in matches)
+    scopes = {scope for length, scope in matches if length == longest}
+    if len(scopes) != 1:
+        raise JournalError("ambiguous target scopes; specify the primary_path or scope_id")
+    return scopes.pop()
 
 
 def _within(path: str, directory: str) -> bool:
@@ -306,6 +321,12 @@ def _work_identity(event: Dict[str, Any]) -> Tuple[str, ...]:
         str(event.get("work_id") or "event:" + event["event_id"]),)
 
 
+def _event_order(event: Dict[str, Any]) -> Tuple[dt.datetime, dt.datetime, str]:
+    occurred = dt.datetime.fromisoformat(event["occurred_at"].replace("Z", "+00:00"))
+    recorded = dt.datetime.fromisoformat((event.get("recorded_at") or event["occurred_at"]).replace("Z", "+00:00"))
+    return occurred, recorded, event["event_id"]
+
+
 def _assign_work(root: Path, event: Dict[str, Any], work_id: str, title: str) -> None:
     items = load_work_items(root)
     prior = project_events(root, load_events(root))
@@ -316,8 +337,9 @@ def _assign_work(root: Path, event: Dict[str, Any], work_id: str, title: str) ->
     if not work_id and not title:
         candidates = {e["work_id"] for e in eligible}
         if len(candidates) == 1:
-            work_id = eligible[-1]["work_id"]
-            title = eligible[-1].get("work_title", "")
+            latest = max(eligible, key=_event_order)
+            work_id = latest["work_id"]
+            title = latest.get("work_title", "")
         elif len(candidates) > 1:
             event["quality_notes"].append("关联了多个事项的剩余动作；本事件未自动并入任何事项")
             return
@@ -331,7 +353,7 @@ def _assign_work(root: Path, event: Dict[str, Any], work_id: str, title: str) ->
         known = [e for e in prior if e.get("work_id") == work_id and all(
             e.get(k, "") == event.get(k, "") for k in ("scope_id", "host_id", "profile_id"))]
         if known:
-            title = max(known, key=lambda e: (e["occurred_at"], e["event_id"])).get("work_title", "")
+            title = max(known, key=_event_order).get("work_title", "")
         else:
             definitions = [i for i in items if i["work_id"] == work_id and all(
                 i[k] == event.get(k, "") for k in ("scope_id", "host_id", "profile_id"))]
@@ -353,6 +375,53 @@ def _event_file(root: Path, event: Dict[str, Any]) -> Path:
 def _find_event(root: Path, event_id: str) -> Optional[Path]:
     found = list((root / "events").glob(f"*/*/{event_id}.json"))
     return found[0] if found else None
+
+
+def _idempotent_event(root: Path, key_hash: str) -> Optional[Dict[str, Any]]:
+    """Called under the journal lock; indexes are hints, event facts are authoritative."""
+    ref_path = root / "idempotency" / f"{key_hash}.json"
+    if ref_path.exists():
+        try:
+            ref = json.loads(ref_path.read_text(encoding="utf-8"))
+            event_id = safe_id(ref["event_id"], "idempotency event_id")
+            path = _find_event(root, event_id) if event_id else None
+            if path:
+                event = json.loads(path.read_text(encoding="utf-8"))
+                if (not validate_event(event) and event.get("idempotency_key_hash") == key_hash
+                        and event.get("event_id") == event_id):
+                    return dict(event, _path=str(path))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            pass
+
+    # The process may have stopped after saving the fact but before its index.
+    matches = [e for e in load_events(root) if e.get("idempotency_key_hash") == key_hash]
+    if len(matches) > 1:
+        raise JournalError("multiple facts share this idempotency key; inspect doctor before retrying")
+    if not matches:
+        if ref_path.exists():
+            raise JournalError("idempotency reference has no matching fact; inspect doctor before retrying")
+        return None
+    event = matches[0]
+    _atomic_write(ref_path, _json_bytes({"event_id": event["event_id"]}))
+    return event
+
+
+def _validate_lifecycle_targets(root: Path, event: Dict[str, Any]) -> None:
+    targets = set(event["resolves_event_ids"] + event["supersedes_event_ids"])
+    if not targets:
+        return
+    old_events = []
+    for event_id in targets:
+        path = _find_event(root, event_id)
+        if path is None:
+            raise JournalError(f"lifecycle target does not exist: {event_id}")
+        old_events.append(json.loads(path.read_text(encoding="utf-8")))
+    # Explicit historical reclassification may correct scope, never host/Profile.
+    projected = project_events(root, [event, *old_events])
+    for old in projected[1:]:
+        for field in ("scope_id", "host_id", "profile_id"):
+            if old.get(field, "") != projected[0].get(field, ""):
+                raise JournalError(f"cannot close follow-ups across {field}: {old['event_id']}")
 
 
 def _list_text(values: Optional[Sequence[str]], field: str, max_items: int = 32) -> Tuple[List[str], int]:
@@ -380,9 +449,16 @@ def _semantic_marker(root: Path, event: Dict[str, Any]) -> None:
         "recorded_at": event["recorded_at"],
         "cwd": event.get("cwd", ""),
         "scope_id": event["scope_id"],
+        "session_id": session_id,
+        "turn_id": event.get("turn_id", ""),
+        "host_id": event.get("host_id", ""),
+        "profile_id": event.get("profile_id", ""),
+        "changed_paths": event.get("changed_paths", []),
     }
     marker_path = root / ".spool" / "semantic" / session_id / f"{event['event_id']}.json"
-    _atomic_write(marker_path, _json_bytes(marker), overwrite=False)
+    payload = _json_bytes(marker)
+    if not marker_path.exists() or marker_path.read_bytes() != payload:
+        _atomic_write(marker_path, payload)
 
 
 def record_event(
@@ -494,38 +570,43 @@ def record_event(
 
     effective_session = session_id or os.environ.get("CODEX_SESSION_ID") or os.environ.get("CODEX_THREAD_ID") or ""
     effective_session = safe_id(effective_session, "session_id") if effective_session else ""
-    effective_turn = safe_id(turn_id, "turn_id") if turn_id else ""
+    effective_turn = safe_id(turn_id or os.environ.get("CODEX_TURN_ID"), "turn_id")
     effective_host = safe_id(host_id or socket.gethostname(), "host_id")
     effective_profile = safe_id(profile_id, "profile_id") if profile_id else ""
-    effective_scope = safe_id(scope_id, "scope_id") if scope_id else route_scope(root, safe_cwd, safe_paths, target_path)
+    if scope_id:
+        effective_scope = safe_id(scope_id, "scope_id")
+    else:
+        try:
+            effective_scope = route_scope(root, safe_cwd, safe_paths, target_path)
+        except (JournalError, OSError, ValueError) as exc:
+            effective_scope = "UNASSIGNED"
+            quality_notes.append(f"对象路由不可用（{type(exc).__name__}）；已保留事实，scope 为 UNASSIGNED。检查 registry.json 或明确主目标")
 
     key_hash = ""
+    legacy_key_hash = ""
     if idempotency_key:
-        clean_key, found = safe_text(idempotency_key, "idempotency_key", 300)
-        redactions += found
-        key_hash = hashlib.sha256(clean_key.encode("utf-8")).hexdigest()
+        clean_key, _ = safe_text(idempotency_key, "idempotency_key", 300)
+        if not clean_key:
+            raise JournalError("idempotency_key must not be blank")
+        # Hash the full key; display redaction/truncation must not merge operations.
+        key_hash = hashlib.sha256(idempotency_key.strip().encode("utf-8")).hexdigest()
+        legacy_key_hash = hashlib.sha256(clean_key.encode("utf-8")).hexdigest()
 
     with journal_lock(root):
         if key_hash:
-            ref_path = root / "idempotency" / f"{key_hash}.json"
-            if ref_path.exists():
-                with ref_path.open("r", encoding="utf-8") as handle:
-                    ref = json.load(handle)
-                existing_path = _find_event(root, ref["event_id"])
+            existing = _idempotent_event(root, key_hash)
+            if existing:
+                _semantic_marker(root, existing)
                 return {
-                    "event_id": ref["event_id"],
-                    "event_path": str(existing_path) if existing_path else "",
+                    "event_id": existing["event_id"],
+                    "event_path": existing["_path"],
                     "duplicate": True,
-                    "work_id": json.loads(existing_path.read_text()).get("work_id", "") if existing_path else "",
+                    "work_id": existing.get("work_id", ""),
+                    "work_title": existing.get("work_title", ""),
+                    "warnings": existing.get("quality_notes", []),
                 }
-
-        for old_id in resolves + supersedes:
-            old_path = _find_event(root, old_id)
-            if old_path is None:
-                raise JournalError(f"lifecycle target does not exist: {old_id}")
-            old = json.loads(old_path.read_text(encoding="utf-8"))
-            if old.get("profile_id", "") != effective_profile:
-                raise JournalError("cannot close another Profile's follow-ups")
+            if legacy_key_hash != key_hash and _idempotent_event(root, legacy_key_hash):
+                raise JournalError("legacy idempotency key was transformed; inspect the existing fact before choosing a new key")
 
         event = {
             "schema_version": SCHEMA_VERSION,
@@ -571,6 +652,7 @@ def record_event(
             event["work_id"] = work_id or ("work-" + event["event_id"] if work_title else "")
             event["work_title"] = work_title or (safe_summary if work_id else "")
             quality_notes.append(f"事项索引不可用（{type(exc).__name__}）；已保留事件和显式事项信息，未猜测归类。修复索引后重建视图")
+        _validate_lifecycle_targets(root, event)
         event_path = _event_file(root, event)
         _atomic_write(event_path, _json_bytes(event), overwrite=False)
         if key_hash:
@@ -584,13 +666,22 @@ def record_event(
                 "work_id": event["work_id"], "work_title": event["work_title"], "warnings": quality_notes}
 
 
-def load_events(root: Path) -> List[Dict[str, Any]]:
+def load_events(root: Path, *, errors: Optional[List[Dict[str, str]]] = None) -> List[Dict[str, Any]]:
     events: List[Dict[str, Any]] = []
     for path in sorted((root / "events").glob("*/*/*.json")):
         if path.name.startswith(".") or path.name.endswith(".tmp"):
             continue
-        with path.open("r", encoding="utf-8") as handle:
-            event = json.load(handle)
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                event = json.load(handle)
+            issues = validate_event(event)
+            if issues:
+                raise JournalError("; ".join(issues))
+        except (OSError, ValueError) as exc:
+            if errors is None:
+                raise JournalError(f"cannot read event {path}: {exc}") from exc
+            errors.append({"path": str(path), "error": f"{type(exc).__name__}: {exc}"})
+            continue
         event["_path"] = str(path)
         events.append(event)
     return events
@@ -618,7 +709,7 @@ def _write_view(path: Path, text: str) -> None:
 
 
 def _timeline(root: Path, view_path: Path, events: Sequence[Dict[str, Any]], title: str) -> str:
-    ordered = sorted(events, key=lambda item: (item.get("occurred_at", ""), item.get("event_id", "")), reverse=True)
+    ordered = sorted(events, key=_event_order, reverse=True)
     derived_at = max((event.get("recorded_at", "") for event in ordered), default="无事件")
     lines = [
         f"# {title}",
@@ -680,7 +771,7 @@ def legacy_continuation_events(events: Sequence[Dict[str, Any]]) -> List[Dict[st
 
 def current_lessons(events: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     latest = {}
-    for e in sorted(events, key=lambda x: (x.get("occurred_at", ""), x.get("event_id", ""))):
+    for e in sorted(events, key=_event_order):
         lesson = e.get("lesson") or {}
         if lesson.get("key"):
             key = (e.get("scope_id"), e.get("host_id"), e.get("profile_id"), lesson["key"])
@@ -700,8 +791,7 @@ def work_cards(events: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         grouped[_work_identity(event)].append(event)
     cards = []
     for identity, group in grouped.items():
-        group = sorted(group, key=lambda e: (e["occurred_at"],
-            dt.datetime.fromisoformat(e.get("recorded_at", e["occurred_at"]).replace("Z", "+00:00")), e["event_id"]))
+        group = sorted(group, key=_event_order)
         latest = group[-1]
         pending = [{"event_id": e["event_id"], "action": action} for e in group
                    if e["event_id"] in pending_ids for action in meaningful_follow_ups(e.get("follow_ups", []))]
@@ -720,7 +810,7 @@ def work_cards(events: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         else:
             card["view_name"] = ""
         cards.append(card)
-    return sorted(cards, key=lambda c: (c["latest_at"], c["latest_event_id"]), reverse=True)
+    return sorted(cards, key=lambda c: _event_order(c["_events"][-1]), reverse=True)
 
 
 def _card_link(root: Path, view: Path, card: Dict[str, Any]) -> str:
@@ -778,7 +868,7 @@ def render_work_views(root: Path, events: Sequence[Dict[str, Any]]) -> List[Dict
 
 def _followup_lines(root: Path, view: Path, events: Sequence[Dict[str, Any]]) -> List[str]:
     lines = []
-    for e in sorted(events, key=lambda x: x.get("occurred_at", ""), reverse=True):
+    for e in sorted(events, key=_event_order, reverse=True):
         identity = " / ".join(str(e.get(k)) for k in ("scope_id", "host_id", "profile_id") if e.get(k))
         for item in meaningful_follow_ups(e.get("follow_ups", [])):
             lines.append(f"- **{_md(identity)}**：{_md(item)} · [来源]({_event_link(root, view, e)})")
@@ -787,7 +877,7 @@ def _followup_lines(root: Path, view: Path, events: Sequence[Dict[str, Any]]) ->
 
 def _lesson_lines(root: Path, view: Path, events: Sequence[Dict[str, Any]]) -> List[str]:
     lines = []
-    for e in sorted(events, key=lambda x: x.get("occurred_at", ""), reverse=True):
+    for e in sorted(events, key=_event_order, reverse=True):
         lesson = e["lesson"]
         identity = " / ".join(str(e.get(k)) for k in ("scope_id", "host_id", "profile_id") if e.get(k))
         lines.extend([f"- **{_md(identity)}** · {_md(lesson['trigger'])}",
@@ -811,7 +901,7 @@ def render_review_views(root: Path, events: Sequence[Dict[str, Any]]) -> Dict[st
              *_followup_lines(root, continuation, pending), "",
              f"[历史未决记录]({legacy_path.name})保留限制说明与待核线索；核实后才登记 follow-up。"]
     attention = sorted([e for e in legacy if e.get("phase") in {"failed", "needs_attention"}],
-                       key=lambda e: e.get("occurred_at", ""), reverse=True)
+                       key=_event_order, reverse=True)
     if attention:
         lines.extend(["", f"## 历史需关注（共 {len(attention)} 条，未核实现状，显示最近 3 条）", ""])
         for e in attention[:3]:
@@ -867,6 +957,8 @@ def render_views(root: Path) -> Dict[str, Any]:
 
 def validate_event(event: Dict[str, Any]) -> List[str]:
     issues: List[str] = []
+    if not isinstance(event, dict):
+        return ["event must be an object"]
     required = {
         "schema_version",
         "event_id",
@@ -882,14 +974,37 @@ def validate_event(event: Dict[str, Any]) -> List[str]:
     missing = sorted(required - set(event))
     if missing:
         issues.append(f"missing fields: {', '.join(missing)}")
-    if event.get("schema_version") not in SUPPORTED_SCHEMA_VERSIONS:
+    if not isinstance(event.get("schema_version"), str) or event["schema_version"] not in SUPPORTED_SCHEMA_VERSIONS:
         issues.append("unsupported schema_version")
-    if event.get("phase") not in PHASES:
+    if not isinstance(event.get("phase"), str) or event["phase"] not in PHASES:
         issues.append("invalid phase")
+    if not isinstance(event.get("event_id"), str) or not SAFE_ID_RE.fullmatch(event["event_id"]):
+        issues.append("invalid event_id")
+    for field in ("scope_id", "host_id", "profile_id", "actor", "source", "session_id", "turn_id", "work_id", "work_title", "summary", "primary_path", "cwd"):
+        if not isinstance(event.get(field, ""), str):
+            issues.append(f"invalid {field}")
+    for field in ("occurred_at", "recorded_at"):
+        try:
+            parsed = dt.datetime.fromisoformat(event[field].replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                raise ValueError("missing timezone")
+        except (KeyError, ValueError, TypeError, AttributeError):
+            issues.append(f"invalid {field}")
+    for field in ("changed_paths", "follow_ups", "unresolved", "related_event_ids", "resolves_event_ids", "supersedes_event_ids", "limitations", "quality_notes"):
+        value = event.get(field, [])
+        if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+            issues.append(f"invalid {field}")
+    lesson = event.get("lesson", {})
+    if not isinstance(lesson, dict) or (lesson and any(not isinstance(lesson.get(k), str) for k in ("key", "trigger", "check", "status"))):
+        issues.append("invalid lesson")
+    key_hash = event.get("idempotency_key_hash", "")
+    if not isinstance(key_hash, str) or (key_hash and not re.fullmatch(r"[0-9a-f]{64}", key_hash)):
+        issues.append("invalid idempotency_key_hash")
     if event.get("work_id") and not SAFE_ID_RE.fullmatch(str(event["work_id"])):
         issues.append("invalid work_id")
     verification = event.get("verification", {})
-    if verification.get("status") not in VERIFICATION_STATUSES:
+    if (not isinstance(verification, dict) or not isinstance(verification.get("status"), str)
+            or verification["status"] not in VERIFICATION_STATUSES):
         issues.append("invalid verification status")
     serialized = json.dumps(event, ensure_ascii=False)
     if any(pattern.search(serialized) for pattern in SECRET_PATTERNS):
@@ -908,6 +1023,8 @@ def doctor(root: Path) -> Dict[str, Any]:
         issues.append(f"registry: {type(exc).__name__}: {exc}")
 
     ids = set()
+    by_id = {}
+    by_key = defaultdict(list)
     event_count = 0
     for path in sorted((root / "events").glob("*/*/*.json")):
         event_count += 1
@@ -916,10 +1033,15 @@ def doctor(root: Path) -> Dict[str, Any]:
                 event = json.load(handle)
             for issue in validate_event(event):
                 issues.append(f"{path}: {issue}")
+            if not isinstance(event, dict) or not isinstance(event.get("event_id"), str):
+                continue
             event_id = event.get("event_id")
             if event_id in ids:
                 issues.append(f"duplicate event_id: {event_id}")
             ids.add(event_id)
+            by_id[event_id] = event
+            if isinstance(event.get("idempotency_key_hash"), str) and event["idempotency_key_hash"]:
+                by_key[event["idempotency_key_hash"]].append(event_id)
         except (OSError, json.JSONDecodeError) as exc:
             issues.append(f"{path}: {type(exc).__name__}: {exc}")
 
@@ -928,10 +1050,18 @@ def doctor(root: Path) -> Dict[str, Any]:
             with ref_path.open("r", encoding="utf-8") as handle:
                 ref = json.load(handle)
             event_id = safe_id(ref.get("event_id"), "idempotency event_id")
-            if not _find_event(root, event_id):
+            if not event_id or event_id not in by_id:
                 issues.append(f"{ref_path}: event not found: {event_id}")
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            elif by_id[event_id].get("idempotency_key_hash") != ref_path.stem:
+                issues.append(f"{ref_path}: idempotency key does not match event: {event_id}")
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
             issues.append(f"{ref_path}: {type(exc).__name__}: {exc}")
+
+    for key_hash, event_ids in by_key.items():
+        if len(event_ids) > 1:
+            issues.append(f"duplicate idempotency key {key_hash}: {', '.join(event_ids)}")
+        if not (root / "idempotency" / f"{key_hash}.json").exists():
+            issues.append(f"missing idempotency index: {key_hash}")
 
     try:
         for item in load_work_items(root):
@@ -969,7 +1099,8 @@ def query_events(root: Path, path: str = "", scope_id: str = "", profile_id: str
     host = safe_id(host_id, "host_id") if host_id else ""
     if not 1 <= limit <= 50:
         raise JournalError("limit must be between 1 and 50")
-    events = project_events(root, load_events(root))
+    read_errors: List[Dict[str, str]] = []
+    events = project_events(root, load_events(root, errors=read_errors))
     def matches(e):
         if scope and e.get("scope_id") != scope:
             return False
@@ -981,15 +1112,22 @@ def query_events(root: Path, path: str = "", scope_id: str = "", profile_id: str
             return False
         paths = [e.get("primary_path", ""), *e.get("changed_paths", [])]
         return not target or any(p and (_within(p, target) or _within(target, p)) for p in paths)
-    selected = sorted([e for e in events if matches(e)], key=lambda e: (e.get("occurred_at", ""), e.get("event_id", "")), reverse=True)
-    pending = sorted([e for e in open_continuation_events(events) if matches(e)], key=lambda e: (e.get("occurred_at", ""), e.get("event_id", "")), reverse=True)
-    lessons = sorted([e for e in current_lessons(events) if matches(e)], key=lambda e: (e.get("occurred_at", ""), e.get("event_id", "")), reverse=True)
+    selected = sorted([e for e in events if matches(e)], key=_event_order, reverse=True)
     keys = ("event_id", "scope_id", "recorded_scope_id", "host_id", "profile_id", "work_id", "work_title", "phase", "summary", "primary_path", "verification", "follow_ups", "limitations", "quality_notes")
+    if read_errors:
+        # Missing events could contain a closure or lesson retirement: withhold those conclusions.
+        return {"partial": True, "read_errors": read_errors, "matched": len(selected),
+                "events": [{k: e[k] for k in keys if k in e} for e in selected[:limit]],
+                "pending": None, "pending_matched": None, "legacy_pending": None,
+                "lessons": None, "lessons_matched": None, "work_items": None, "work_items_matched": None,
+                "warning": "部分事件无法读取；仅返回已读事实，数量为下限，待办/经验/事项结论暂不可用。请运行 doctor 定位异常"}
+    pending = sorted([e for e in open_continuation_events(events) if matches(e)], key=_event_order, reverse=True)
+    lessons = sorted([e for e in current_lessons(events) if matches(e)], key=_event_order, reverse=True)
     selected_groups = {_work_identity(e) for e in selected}
     cards = [c for c in work_cards(events) if c["work_id"] and _work_identity(c["_events"][-1]) in selected_groups]
     public_cards = [{**{k: v for k, v in c.items() if k not in {"_events", "event_ids", "follow_ups"}},
                      "follow_ups": c["follow_ups"][:limit], "follow_ups_total": len(c["follow_ups"])} for c in cards[:limit]]
-    return {"matched": len(selected), "events": [{k: e[k] for k in keys if k in e} for e in selected[:limit]],
+    return {"partial": False, "matched": len(selected), "events": [{k: e[k] for k in keys if k in e} for e in selected[:limit]],
             "pending_matched": len(pending), "lessons_matched": len(lessons),
             "pending": [{k: e.get(k, "") for k in ("event_id", "scope_id", "host_id", "profile_id", "follow_ups")} for e in pending[:limit]],
             "legacy_pending": sum(matches(e) for e in legacy_continuation_events(events)),

@@ -220,6 +220,7 @@ class CodexHookTests(unittest.TestCase):
             changed_paths=["/workspace/project/semantic.md"],
             verification_status="passed",
             session_id=self.base["session_id"],
+            turn_id=self.base["turn_id"],
         )
         hook.finalize(dict(self.base), self.root)
         events = cj.load_events(self.root)

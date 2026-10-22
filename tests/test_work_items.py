@@ -69,7 +69,9 @@ class WorkItemTests(unittest.TestCase):
         combined = self.record(resolves_event_ids=[a["event_id"], b["event_id"]])
         self.assertEqual(combined["work_id"], "")
         self.assertTrue(combined["warnings"])
-        other = self.record(scope_id="OTHER", resolves_event_ids=[a["event_id"]])
+        with self.assertRaises(cj.JournalError):
+            self.record(scope_id="OTHER", resolves_event_ids=[a["event_id"]])
+        other = self.record(scope_id="OTHER", related_event_ids=[a["event_id"]])
         self.assertEqual(other["work_id"], "")
 
     def test_same_work_name_or_id_never_merges_identity_boundaries(self):

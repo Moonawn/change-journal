@@ -48,7 +48,7 @@ python3 "$HOME/.agents/skills/change-journal/scripts/change_journal.py" record \
 python3 "$HOME/.agents/skills/change-journal/scripts/change_journal.py" query --path /absolute/target --limit 5
 ```
 
-人工审阅从台账 `views/00_审阅入口_REVIEW.md` 开始，默认按事项汇总最近 8 项；展开事项卡查看全部依据。续接可用 `query --work-id <ID>`，跨身份同名事项分别返回。事实、明确待办、历史待核和经验分开显示；最新记录不等于整件事完成，旧状态仍需结合当前证据核实。
+人工审阅从台账 `views/00_审阅入口_REVIEW.md` 开始，默认按事项汇总最近 8 项；展开事项卡查看全部依据。续接可用 `query --work-id <ID>`，跨身份同名事项分别返回。查询若标为 `partial`，只使用已读事实，先用 `doctor` 定位缺失证据，不据此判定待办或经验状态。事实、明确待办、历史待核和经验分开显示；最新记录不等于整件事完成，旧状态仍需结合当前证据核实。
 
 只有已经核实、下次遇到相同条件确实有用的教训，才附加一条 `lesson`（适用条件＋具体检查＋原事件证据）；普通成功不必总结经验。同一 scope/host/profile/key 更新或退役，避免不断追加同义教条。仅在需要记录经验、纠正历史归类、关联状态或接入适配器时读 [schema.md](references/schema.md)。
 

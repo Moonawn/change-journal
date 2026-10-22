@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import re
+import socket
 import sys
 import uuid
 from pathlib import Path
@@ -122,7 +124,7 @@ def _result_state(response: Any) -> str:
 
 def _safe_hook_ids(payload: Dict[str, Any]) -> Tuple[str, str]:
     session = payload.get("session_id") or os.environ.get("CODEX_SESSION_ID") or os.environ.get("CODEX_THREAD_ID")
-    turn = payload.get("turn_id")
+    turn = payload.get("turn_id") or os.environ.get("CODEX_TURN_ID")
     if not session or not turn:
         raise cj.JournalError("hook payload lacks session_id or turn_id")
     return cj.safe_id(str(session), "session_id"), cj.safe_id(str(turn), "turn_id")
@@ -148,10 +150,12 @@ def observe(payload: Dict[str, Any], root: Path) -> None:
     cwd = cj.safe_path(raw_cwd, "cwd") if raw_cwd else ""
     observation = {
         "schema_version": cj.SCHEMA_VERSION,
-        "occurred_at": cj.utc_now(),
+        "occurred_at": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
         "session_id": session,
         "turn_id": turn,
         "cwd": cwd,
+        "host_id": cj.safe_id(payload.get("host_id") or socket.gethostname(), "host_id"),
+        "profile_id": cj.safe_id(payload.get("profile_id"), "profile_id"),
         "tool_name": tool_name,
         "category": category,
         "changed_paths": _extract_paths(payload, command, cwd),
@@ -181,24 +185,47 @@ def _parse_utc(value: str) -> dt.datetime:
     return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def _matching_semantic_marker(root: Path, session: str, observations: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    if not observations:
-        return None
-    earliest = min(_parse_utc(item["occurred_at"]) for item in observations)
-    cwd_values = {item.get("cwd", "") for item in observations if item.get("cwd")}
+def _matching_semantic_markers(root: Path, session: str, turn: str) -> List[Dict[str, Any]]:
+    markers = []
     marker_dir = root / ".spool" / "semantic" / session
-    for path in sorted(marker_dir.glob("*.json"), reverse=True):
+    for path in sorted(marker_dir.glob("*.json")):
         try:
-            with path.open("r", encoding="utf-8") as handle:
-                marker = json.load(handle)
-            if _parse_utc(marker["recorded_at"]) < earliest:
+            marker = json.loads(path.read_text(encoding="utf-8"))
+            if marker.get("session_id") != session or marker.get("turn_id") != turn:
                 continue
-            if cwd_values and marker.get("cwd") not in cwd_values:
+            event_id = cj.safe_id(marker["event_id"], "semantic event_id")
+            event_path = cj._find_event(root, event_id) if event_id else None
+            if not event_path:
                 continue
-            return marker
-        except (OSError, KeyError, ValueError, json.JSONDecodeError):
+            event = json.loads(event_path.read_text(encoding="utf-8"))
+            if (not cj.validate_event(event) and event.get("event_id") == event_id and event.get("source") == "semantic"
+                    and event.get("session_id") == session and event.get("turn_id") == turn):
+                _parse_utc(event["recorded_at"])
+                markers.append(event)
+        except (OSError, KeyError, ValueError, TypeError, AttributeError):
             continue
-    return None
+    return markers
+
+
+def _uncovered_observations(observations: Sequence[Dict[str, Any]], markers: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    remaining, used = [], set()
+    for item in observations:
+        paths = item.get("changed_paths", [])
+        covered = set()
+        for marker in markers:
+            if any(marker.get(k, "") != item.get(k, "") for k in
+                   ("session_id", "turn_id", "cwd", "host_id", "profile_id")):
+                continue
+            if _parse_utc(marker["recorded_at"]) < _parse_utc(item["occurred_at"]):
+                continue
+            overlap = set(paths).intersection(marker.get("changed_paths", []))
+            if overlap:
+                covered.update(overlap)
+                used.add(marker["event_id"])
+        # Unknown paths cannot be proved covered by a directory or time proximity.
+        if not paths or set(paths) - covered:
+            remaining.append(dict(item, changed_paths=[p for p in paths if p not in covered]))
+    return remaining, sorted(used)
 
 
 def finalize(payload: Dict[str, Any], root: Path) -> None:
@@ -211,21 +238,40 @@ def finalize(payload: Dict[str, Any], root: Path) -> None:
     if not observations:
         return
 
-    semantic = _matching_semantic_marker(root, session, observations)
-    if semantic:
+    observations, semantic_ids = _uncovered_observations(
+        observations, _matching_semantic_markers(root, session, turn))
+    if not observations:
         cj._atomic_write(
             finalized,
-            cj._json_bytes({"mode": "semantic", "event_id": semantic["event_id"], "finalized_at": cj.utc_now()}),
+            cj._json_bytes({"mode": "semantic", "event_id": semantic_ids[-1],
+                           "event_ids": semantic_ids, "finalized_at": cj.utc_now()}),
             overwrite=False,
         )
         return
 
+    # A turn can visit more than one identity/cwd; keep their fallback evidence apart.
+    groups = {}
+    for item in observations:
+        identity = (item.get("host_id") or socket.gethostname(), item.get("profile_id", ""), item.get("cwd", ""))
+        groups.setdefault(identity, []).append(item)
+    event_ids = []
+    for identity, group in groups.items():
+        event_ids.append(_record_fallback(root, session, turn, identity, group)["event_id"])
+    cj._atomic_write(
+        finalized,
+        cj._json_bytes({"mode": "mechanical", "event_id": event_ids[-1], "event_ids": event_ids,
+                       "semantic_event_ids": semantic_ids, "finalized_at": cj.utc_now()}),
+        overwrite=False,
+    )
+
+
+def _record_fallback(root: Path, session: str, turn: str, identity: Tuple[str, str, str],
+                     observations: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     changed_paths: List[str] = []
     tool_names: List[str] = []
     result_states: List[str] = []
-    cwd = ""
+    host, profile, cwd = identity
     for item in observations:
-        cwd = cwd or item.get("cwd", "")
         if item.get("tool_name") and item["tool_name"] not in tool_names:
             tool_names.append(item["tool_name"])
         if item.get("result"):
@@ -235,27 +281,33 @@ def finalize(payload: Dict[str, Any], root: Path) -> None:
                 changed_paths.append(path)
 
     verification = "failed" if "error" in result_states else "not_run"
-    result = cj.record_event(
+    legacy_key = f"codex-stop:{session}:{turn}"
+    with cj.journal_lock(root):
+        legacy = cj._idempotent_event(root, hashlib.sha256(legacy_key.encode()).hexdigest())
+        if (legacy and legacy.get("source") == "codex-hook"
+                and (legacy.get("host_id", ""), legacy.get("profile_id", ""), legacy.get("cwd", "")) == identity
+                and legacy.get("session_id") == session and legacy.get("turn_id") == turn):
+            # A previous adapter may have saved its fact before Stop was finalized.
+            return {"event_id": legacy["event_id"], "duplicate": True}
+    group_key = hashlib.sha256(cj._json_bytes(identity)).hexdigest()[:16]
+    return cj.record_event(
         root,
         actor="observer",
         source="codex-hook",
         phase="observed",
         summary=f"Codex Hook 观察到本轮 {len(observations)} 个可能改变状态的工具调用",
-        why="机械兜底记录；本轮没有匹配到更高质量的语义事件",
+        why="机械兜底记录；这些观察尚未被本轮语义事件覆盖",
         cwd=cwd,
         changed_paths=changed_paths,
         verification_status=verification,
         verification_refs=[f"工具类别：{', '.join(tool_names[:8])}"],
         unresolved=["需要在后续语义记录中确认实际变化、验证状态和回滚方式"],
         tags=["codex", "hook", "mechanical-fallback"],
+        host_id=host,
+        profile_id=profile,
         session_id=session,
         turn_id=turn,
-        idempotency_key=f"codex-stop:{session}:{turn}",
-    )
-    cj._atomic_write(
-        finalized,
-        cj._json_bytes({"mode": "mechanical", "event_id": result["event_id"], "finalized_at": cj.utc_now()}),
-        overwrite=False,
+        idempotency_key=f"codex-stop:{session}:{turn}:{group_key}",
     )
 
 
