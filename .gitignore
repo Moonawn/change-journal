@@ -1,0 +1,26 @@
+# Local Python and editor artifacts
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.DS_Store
+.env
+.env.*
+
+# Journal data stays outside the source repository.
+events/
+views/
+idempotency/
+.spool/
+.trace/
+.index/
+.journal.lock
+registry.json
+work-items.json
+备份_BACKUPS/
+backups/
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*

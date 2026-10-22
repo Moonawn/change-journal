@@ -1,0 +1,6 @@
+interface:
+  display_name: "Change Journal"
+  short_description: "记录并验证本机、项目与 Agent 的实际变更和续接点"
+  default_prompt: "Use $change-journal to record this task's verified changes and continuation point."
+policy:
+  allow_implicit_invocation: true
