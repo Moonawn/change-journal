@@ -109,7 +109,9 @@ Hook 兼容读取 1.0/1.1/1.2 的安全 spool；只记录可能的变化、路�
 }
 ```
 
-匹配还核对 host、profile、cwd、精确文件路径及记录先后，不从同一目录或相近时间推测轮次。不同 host/profile/cwd 的兜底分别保存；部分文件已覆盖时，只保留其余文件的观察。接入后可运行 `CHANGE_JOURNAL_HOST_TEST=1 python3 -m unittest discover -s tests -p test_codex_host.py -v`：真实 Codex CLI 执行 Hook，模型响应来自本地确定性 fixture，临时台账隔离，覆盖完整/部分/无语义记录、重试及 code_mode 嵌套工具，不调用外部模型。
+Windows 使用相同的三个处理器和 matcher，将命令替换为 `python "C:/Skills/change-journal/scripts/codex_hook.py" context`，另外两个分别使用 `observe` 和 `stop`。写入 JSON 的例子：`"command": "python \"C:/Skills/change-journal/scripts/codex_hook.py\" context"`。将路径改为实际安装位置，确认 Hook 环境能找到 Python；宿主仍使用 canonical `Bash` 工具名。PowerShell 常见文件写入 cmdlet 会产生机械观察，未提取到精确路径时保留兜底。Windows PowerShell 5.1 手工向适配器传 JSON 前，设置 `$OutputEncoding = [System.Text.UTF8Encoding]::new($false)`，避免管道损失中文。
+
+匹配还核对 host、profile、cwd、精确文件路径及记录先后，不从同一目录或相近时间推测轮次。Windows 路径比较统一大小写和分隔符，事件保留路径文本。不同 host/profile/cwd 的兜底分别保存；部分文件已覆盖时，只保留其余文件的观察。macOS / Linux 接入后可运行 `CHANGE_JOURNAL_HOST_TEST=1 python3 -m unittest discover -s tests -p test_codex_host.py -v`：真实 Codex CLI 执行 Hook，模型响应来自本地确定性 fixture，临时台账隔离，覆盖完整/部分/无语义记录、重试及 code_mode 嵌套工具，不调用外部模型。Windows CI 验证原生文件系统上的 Hook 子进程和身份传递，不代表 Windows Codex 宿主的信任、加载与回调已验证。
 
 缺少关联 ID、无法提取路径、语义记录早于观察或旧 spool 缺少身份信息时，保留机械兜底。宿主不提供轮次信息时仍可能看到两条线索，不能为去重而虚构轮次。Hook 是启发式观察器，不能覆盖所有 shell/自定义工具变更；安装 Skill 不自动接线，需按实际宿主 payload 验证。trace 不自动晋升为语义事件。
 

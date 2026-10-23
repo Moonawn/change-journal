@@ -6,11 +6,21 @@
 
 ## 安装
 
-运行环境：macOS 或 Linux，Python 3.9+。运行和测试仅使用 Python 标准库；文件锁使用 POSIX `fcntl`，Windows 原生环境尚未适配。
+运行环境：macOS、Linux 或原生 Windows，Python 3.9+。运行和测试仅使用 Python 标准库；POSIX 使用 `fcntl` 文件锁，Windows 使用 `msvcrt` 字节锁保护并发写入。
+
+macOS / Linux：
 
 ```bash
 git clone https://github.com/Moonawn/change-journal.git "$HOME/.agents/skills/change-journal"
 python3 "$HOME/.agents/skills/change-journal/scripts/change_journal.py" init
+```
+
+Windows PowerShell（Python 已加入 PATH；也可将 `python` 换成 `py -3`）：
+
+```powershell
+$skillDir = Join-Path $HOME '.agents/skills/change-journal'
+git clone https://github.com/Moonawn/change-journal.git "$skillDir"
+python "$skillDir/scripts/change_journal.py" init
 ```
 
 安装目录已有同名 Skill 时，先保留原目录，再选择单独位置检查新版本；不要覆盖正在使用的个人配置。也可以将仓库安装到其他 Agent 支持的 Skill 目录。
@@ -42,6 +52,23 @@ python3 scripts/change_journal.py doctor
 ```
 
 对象路由使用台账 `registry.json` 中的最长路径前缀。初始化只注册 Skill 和台账本身；业务目录按需添加，未匹配的目标保留为 `UNASSIGNED`。
+
+Windows PowerShell 示例（反引号用于续行，末尾不要加空格）：
+
+```powershell
+python scripts/change_journal.py record `
+  --actor codex --source semantic --phase verified `
+  --summary '修复导出错误并通过隔离验证' `
+  --primary-path 'C:/Projects/demo' `
+  --changed-path 'C:/Projects/demo/export.py' `
+  --work-id export-fix --work-title '导出错误修复' `
+  --verification-status passed --verification-ref '对应测试通过' `
+  --idempotency-key export-fix-verified --render
+python scripts/change_journal.py query --path 'C:/Projects/demo' --limit 5
+python scripts/change_journal.py doctor
+```
+
+Windows 盘符路径和 UNC 路径均可使用，匹配时忽略大小写并统一分隔符；POSIX 路径仍区分大小写。可以在另一系统查询已有路径记录。`registry.json` 中 Windows 路径建议写为 `C:/Projects/demo`；反斜线按 JSON 语法写成 `\\`。事件与视图保存为 UTF-8，CLI JSON 使用 Unicode 转义以兼容重定向和旧控制台编码。
 
 ## 记录结构
 
@@ -77,7 +104,7 @@ python3 scripts/change_journal.py doctor
 
 `scripts/hermes_adapter.py` 从 stdin JSON 接收语义记录；`scripts/codex_hook.py` 提供工具变化观察和机械兜底。安装仓库不会自动配置 Hook、创建定时任务或接入外部服务。
 
-`trace_collect.py` 和 `trace_sources.py` 是可选实验工具，目前仅 `survey` 实现了只读统计；`collect/promote/prune` 尚未实现。它们不参与默认记录流程。
+`trace_collect.py` 和 `trace_sources.py` 是可选实验工具，目前仅 `survey` 实现了只读统计；`collect/promote/prune` 尚未实现。它们不参与默认记录流程；Cindy 数据发现仍使用 macOS 的默认目录。
 
 仓库包含程序、规范和测试。真实事件、归类配置、备份及会话痕迹存放在本地台账目录；`.gitignore` 也排除了这些运行数据。文本脱敏只是补充检查，不能代替记录者选择合适的摘要与证据引用。
 
@@ -87,7 +114,14 @@ python3 scripts/change_journal.py doctor
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 ```
 
-测试使用隔离临时目录，覆盖追加记录、幂等写入、对象路由、事项汇总、身份边界、待办关系、经验版本和归类失败时的事实保留。
+Windows PowerShell：
+
+```powershell
+$env:PYTHONDONTWRITEBYTECODE = '1'
+python -m unittest discover -s tests -v
+```
+
+测试使用隔离临时目录，覆盖追加记录、并发与幂等写入、跨系统路径、中文输出、Hook 子进程去重、事项汇总、身份边界、待办关系和经验版本。GitHub Actions 在 Windows、Linux、macOS 运行测试，并在 Windows 验证 PowerShell 7 和 Windows PowerShell 5.1 命令。真实 Codex 宿主测试另行选择运行，不能由 Hook payload 测试推断宿主已经接线。
 
 ## 版权
 

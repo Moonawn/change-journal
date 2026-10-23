@@ -37,7 +37,7 @@ class HookContextTests(unittest.TestCase):
                                summary="context test", **kw)
 
     def event_turn(self, **kw):
-        return json.loads(Path(self.record(**kw)["event_path"]).read_text())["turn_id"]
+        return json.loads(Path(self.record(**kw)["event_path"]).read_text(encoding="utf-8"))["turn_id"]
 
     def test_exact_tool_call_resolves_real_context_and_post_tool_cleans_it(self):
         payload = self.payload()
@@ -70,7 +70,7 @@ class HookContextTests(unittest.TestCase):
         payload["tool_input"]["command"] += " --summary private-details"
         hook.capture_context(payload, self.root)
         path = next((self.root / ".spool/codex-context").rglob("*.json"))
-        self.assertEqual(json.loads(path.read_text()), {
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {
             "session_id": "session", "turn_id": "turn-a", "tool_use_id": "call-a",
             "host_id": socket.gethostname(), "profile_id": "",
         })
@@ -84,7 +84,7 @@ class HookContextTests(unittest.TestCase):
         path.parent.mkdir(parents=True)
         for content in ("{broken", "[]", "null", json.dumps(dict(self.payload(), tool_use_id="wrong"))):
             with self.subTest(content=content):
-                path.write_text(content)
+                path.write_text(content, encoding="utf-8")
                 self.assertEqual(self.event_turn(), "")
 
 

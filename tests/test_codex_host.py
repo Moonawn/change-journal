@@ -96,7 +96,7 @@ class CodexHostTests(unittest.TestCase):
             # Keep persisted hook trust, but do not start unrelated user MCP servers.
             config_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
             config_path = config_home / "config.toml"
-            config = config_path.read_text() if config_path.exists() else ""
+            config = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
             for quoted, bare in re.findall(r'^\[mcp_servers\.(?:"([^"]+)"|([\w-]+))\]\s*$', config, re.M):
                 cmd += ["-c", 'mcp_servers.' + (quoted or bare) + '.enabled=false']
             cmd.append("Run the local Hook integration fixture.")
@@ -127,7 +127,7 @@ class CodexHostTests(unittest.TestCase):
             fallback = [e for e in facts if e["source"] == "codex-hook"]
             self.assertEqual(len(semantic), 0 if coverage == "none" else 1, result.stdout[-3000:])
             self.assertEqual(len(fallback), 0 if coverage == "full" else 1)
-            observations = [json.loads(p.read_text()) for p in (root / ".spool/codex").glob("*/*/*.json")
+            observations = [json.loads(p.read_text(encoding="utf-8")) for p in (root / ".spool/codex").glob("*/*/*.json")
                             if not p.name.startswith(".")]
             self.assertTrue(observations, "trusted PostToolUse did not run")
             identities = {(o["session_id"], o["turn_id"]) for o in observations}
@@ -139,7 +139,7 @@ class CodexHostTests(unittest.TestCase):
             if fallback:
                 self.assertEqual(set(fallback[0]["changed_paths"]), {str(p) for p in paths[0 if coverage == "none" else 1:]})
             finalized = root / ".spool/codex" / session / turn / ".finalized.json"
-            self.assertEqual(json.loads(finalized.read_text())["mode"], "semantic" if coverage == "full" else "mechanical")
+            self.assertEqual(json.loads(finalized.read_text(encoding="utf-8"))["mode"], "semantic" if coverage == "full" else "mechanical")
             before = {p: p.read_bytes() for p in (root / "events").glob("*/*/*.json")}
             hook.finalize({"session_id": session, "turn_id": turn}, root)
             self.assertEqual(before, {p: p.read_bytes() for p in (root / "events").glob("*/*/*.json")})

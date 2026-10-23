@@ -36,7 +36,7 @@ class WorkItemTests(unittest.TestCase):
         item = dict(work_id="review-task", title="本轮审阅", scope_id="PROJECT", host_id="local-host",
                     profile_id="personal", event_ids=list(event_ids), bindings=[])
         item.update(kw)
-        (self.root / "work-items.json").write_text(json.dumps({"schema_version": "1.0", "items": [item]}))
+        (self.root / "work-items.json").write_text(json.dumps({"schema_version": "1.0", "items": [item]}), encoding="utf-8")
         return item
 
     def hashes(self):
@@ -94,8 +94,8 @@ class WorkItemTests(unittest.TestCase):
         old_view = next((self.root / "views/by-work").glob("*.md"))
         self.catalog([old["event_id"]], scope_id="CORRECTED", work_id="correct-task")
         cj.render_views(self.root)
-        self.assertIn("停用", old_view.read_text())
-        self.assertIn("停用", (self.root / "views/by-scope/PROJECT.md").read_text())
+        self.assertIn("停用", old_view.read_text(encoding="utf-8"))
+        self.assertIn("停用", (self.root / "views/by-scope" / (cj._scope_slug("PROJECT") + ".md")).read_text(encoding="utf-8"))
         self.assertEqual(cj.query_events(self.root, scope_id="PROJECT")["matched"], 0)
         self.assertEqual(cj.query_events(self.root, scope_id="CORRECTED")["matched"], 1)
         self.assertEqual(before, self.hashes())
@@ -117,13 +117,13 @@ class WorkItemTests(unittest.TestCase):
         self.catalog(["missing-event"])
         self.assertFalse(cj.doctor(self.root)["ok"])
         item = self.catalog([old["event_id"]])
-        (self.root / "work-items.json").write_text(json.dumps({"schema_version": "1.0", "items": [item, dict(item, work_id="other")]}))
+        (self.root / "work-items.json").write_text(json.dumps({"schema_version": "1.0", "items": [item, dict(item, work_id="other")]}), encoding="utf-8")
         with self.assertRaises(cj.JournalError):
             cj.query_events(self.root, scope_id="PROJECT")
 
     def test_ambiguous_binding_preserves_fact_without_guessing_task(self):
         item = self.catalog(bindings=[{"session_id": "task-session", "path": "/tmp/project/task"}])
-        (self.root / "work-items.json").write_text(json.dumps({"schema_version": "1.0", "items": [item, dict(item, work_id="other")]}))
+        (self.root / "work-items.json").write_text(json.dumps({"schema_version": "1.0", "items": [item, dict(item, work_id="other")]}), encoding="utf-8")
         result = self.record()
         self.assertEqual(result["work_id"], "")
         self.assertTrue(result["warnings"])
@@ -131,7 +131,7 @@ class WorkItemTests(unittest.TestCase):
         self.assertFalse(cj.doctor(self.root)["ok"])
 
     def test_malformed_index_does_not_block_fact_capture(self):
-        (self.root / "work-items.json").write_text("not valid json")
+        (self.root / "work-items.json").write_text("not valid json", encoding="utf-8")
         result = self.record(work_id="explicit-task", work_title="Explicit task")
         self.assertEqual(result["work_id"], "explicit-task")
         self.assertTrue(result["warnings"])
@@ -167,7 +167,7 @@ class WorkItemTests(unittest.TestCase):
         self.assertEqual(result["work_id"], "hermes-task")
         spool = self.root / ".spool/new"
         spool.mkdir()
-        (spool / "new.json").write_text(json.dumps({"schema_version": "1.2", "category": "file_mutation"}))
+        (spool / "new.json").write_text(json.dumps({"schema_version": "1.2", "category": "file_mutation"}), encoding="utf-8")
         self.assertEqual(len(hook._load_observations(spool)), 1)
 
     def test_title_only_starts_task_and_same_second_order_is_preserved(self):
@@ -179,9 +179,9 @@ class WorkItemTests(unittest.TestCase):
 
     def test_object_routes_do_not_reclassify_unassigned_history(self):
         old = self.record(scope_id="BROAD")
-        registry = json.loads((self.root / "registry.json").read_text())
+        registry = json.loads((self.root / "registry.json").read_text(encoding="utf-8"))
         registry["routes"].append({"path": "/tmp/project", "scope_id": "PROJECT"})
-        (self.root / "registry.json").write_text(json.dumps(registry))
+        (self.root / "registry.json").write_text(json.dumps(registry), encoding="utf-8")
         new = self.record(scope_id="")
         self.assertEqual(cj.query_events(self.root, scope_id="PROJECT")["events"][0]["event_id"], new["event_id"])
         self.assertEqual(cj.query_events(self.root, scope_id="BROAD")["events"][0]["event_id"], old["event_id"])

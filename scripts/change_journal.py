@@ -6,17 +6,25 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
-import fcntl
+import errno
 import hashlib
 import json
+import ntpath
 import os
+import posixpath
 import re
 import socket
 import sys
+import time
 import uuid
 from collections import Counter, defaultdict
-from pathlib import Path, PurePath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 
 SCHEMA_VERSION = "1.2"
@@ -103,12 +111,60 @@ def safe_path(value: Optional[str], field: str = "path") -> str:
         raise JournalError(f"{field} contains invalid characters")
     if any(pattern.search(raw) for pattern in SECRET_PATTERNS):
         raise JournalError(f"{field} appears to contain secret material")
-    candidate = Path(raw).expanduser()
+    raw = os.path.expanduser(raw)
+    flavour = _path_flavour(raw)
+    candidate = PureWindowsPath(raw) if flavour is ntpath else PurePosixPath(raw)
     if not candidate.is_absolute():
         raise JournalError(f"{field} must be an absolute path")
-    if ".." in PurePath(raw).parts:
+    if ".." in candidate.parts:
         raise JournalError(f"{field} must not contain path traversal")
-    return os.path.normpath(str(candidate))
+    return flavour.normpath(str(candidate))
+
+
+def _path_flavour(value: str):
+    # Evidence can describe another host; do not reinterpret it using this OS.
+    return ntpath if re.match(r"^[A-Za-z]:", value) or value.startswith(("\\", "//")) else posixpath
+
+
+def path_key(value: str) -> str:
+    if not value:
+        return ""
+    flavour = _path_flavour(value)
+    return flavour.normcase(flavour.normpath(value))
+
+
+def absolute_path(value: str, cwd: str = "") -> str:
+    """Resolve a tool's relative path using the working directory's flavour."""
+    value = os.path.expanduser(value)
+    flavour = _path_flavour(value)
+    pure = PureWindowsPath(value) if flavour is ntpath else PurePosixPath(value)
+    if not pure.is_absolute():
+        if not cwd or pure.anchor:
+            raise JournalError("path requires an unambiguous absolute working directory")
+        value = _path_flavour(cwd).join(cwd, value)
+    return safe_path(value)
+
+
+def _portable_name(value: str) -> bool:
+    device = value.split(".", 1)[0].upper()
+    return (not value.endswith(".") and ":" not in value
+            and device not in {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+            and not re.fullmatch(r"(?:COM|LPT)[1-9]", device))
+
+
+def file_component(value: str) -> str:
+    """Keep common IDs readable, encode others without case-folding collisions."""
+    if re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,127}", value) and _portable_name(value):
+        return value
+    stem = re.sub(r"[^a-z0-9_-]+", "-", value.lower()).strip("-")[:40] or "id"
+    return stem + "~" + hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
+
+
+def component_paths(parent: Path, value: str, suffix: str = "") -> List[Path]:
+    """Read old spool names during upgrades; new writes use the portable name."""
+    current = parent / (file_component(value) + suffix)
+    legacy = parent / (value + suffix)
+    return [current, legacy] if legacy != current and (os.name != "nt" or _portable_name(value)) else [current]
 
 
 def _json_bytes(payload: Any) -> bytes:
@@ -118,7 +174,7 @@ def _json_bytes(payload: Any) -> bytes:
 def _atomic_write(path: Path, payload: bytes, overwrite: bool = True) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
-    fd = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    fd = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(payload)
@@ -136,13 +192,29 @@ def _atomic_write(path: Path, payload: bytes, overwrite: bool = True) -> None:
 def journal_lock(root: Path) -> Iterator[None]:
     root.mkdir(parents=True, exist_ok=True)
     lock_path = root / ".journal.lock"
-    with lock_path.open("a+", encoding="utf-8") as handle:
-        os.chmod(lock_path, 0o600)
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    with lock_path.open("a+b") as handle:
+        if os.name == "nt":
+            # All processes lock byte zero, including on an initially empty file.
+            handle.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as exc:
+                    if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                        raise
+                    time.sleep(0.05)
+        else:
+            os.chmod(lock_path, 0o600)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
             yield
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            if os.name == "nt":
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def default_registry(root: Optional[Path] = None) -> Dict[str, Any]:
@@ -177,7 +249,7 @@ def init_root(root: Path) -> Dict[str, Any]:
 
 
 def load_registry(root: Path) -> Dict[str, Any]:
-    with (root / "registry.json").open("r", encoding="utf-8") as handle:
+    with (root / "registry.json").open("r", encoding="utf-8-sig") as handle:
         registry = json.load(handle)
     if not isinstance(registry, dict) or not isinstance(registry.get("routes"), list):
         raise JournalError("registry routes must be a list")
@@ -189,9 +261,10 @@ def load_registry(root: Path) -> Dict[str, Any]:
         scope = safe_id(item.get("scope_id"), "registry scope_id")
         if not path or not scope:
             raise JournalError("registry route needs path and scope_id")
-        if path in scopes_by_path and scopes_by_path[path] != scope:
+        key = path_key(path)
+        if key in scopes_by_path and scopes_by_path[key] != scope:
             raise JournalError(f"conflicting scopes for registry path: {path}")
-        scopes_by_path[path] = scope
+        scopes_by_path[key] = scope
     return registry
 
 
@@ -210,12 +283,8 @@ def route_scope(root: Path, cwd: str = "", changed_paths: Sequence[str] = (), pr
         prefix = safe_path(item.get("path"), "registry path")
         scope_id = safe_id(item.get("scope_id"), "registry scope_id")
         for candidate in candidates:
-            try:
-                common = os.path.commonpath([prefix, candidate])
-            except ValueError:
-                continue
-            if common == prefix:
-                matches.append((len(prefix), scope_id))
+            if _within(candidate, prefix):
+                matches.append((len(path_key(prefix)), scope_id))
     if not matches:
         return safe_id(registry.get("unknown_scope"), "unknown_scope", "UNASSIGNED")
     longest = max(length for length, _ in matches)
@@ -226,8 +295,11 @@ def route_scope(root: Path, cwd: str = "", changed_paths: Sequence[str] = (), pr
 
 
 def _within(path: str, directory: str) -> bool:
+    if not path or not directory or _path_flavour(path) is not _path_flavour(directory):
+        return False
     try:
-        return os.path.commonpath([path, directory]) == directory
+        flavour = _path_flavour(path)
+        return flavour.commonpath([path_key(path), path_key(directory)]) == path_key(directory)
     except ValueError:
         return False
 
@@ -237,7 +309,7 @@ def load_work_items(root: Path) -> List[Dict[str, Any]]:
     path = root / "work-items.json"
     if not path.exists():
         return []
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
     if not isinstance(data, dict) or data.get("schema_version") != "1.0" or not isinstance(data.get("items"), list):
         raise JournalError("work-items.json needs schema_version 1.0 and an items list")
     items, identities, assigned = [], set(), set()
@@ -455,7 +527,7 @@ def _semantic_marker(root: Path, event: Dict[str, Any]) -> None:
         "profile_id": event.get("profile_id", ""),
         "changed_paths": event.get("changed_paths", []),
     }
-    marker_path = root / ".spool" / "semantic" / session_id / f"{event['event_id']}.json"
+    marker_path = root / ".spool" / "semantic" / file_component(session_id) / f"{event['event_id']}.json"
     payload = _json_bytes(marker)
     if not marker_path.exists() or marker_path.read_bytes() != payload:
         _atomic_write(marker_path, payload)
@@ -467,13 +539,16 @@ def _hook_turn_id(root: Path, session: str, host: str, profile: str) -> str:
         tool_id = safe_id(os.environ.get("CODEX_TOOL_CALL_ID"), "tool_use_id")
         if not session or not tool_id:
             return ""
-        path = root / ".spool" / "codex-context" / session / f"{tool_id}.json"
-        context = json.loads(path.read_text(encoding="utf-8"))
-        if any(context.get(k, "") != v for k, v in (
-                ("session_id", session), ("tool_use_id", tool_id),
-                ("host_id", host), ("profile_id", profile))):
-            return ""
-        return safe_id(context.get("turn_id"), "turn_id")
+        for directory in component_paths(root / ".spool" / "codex-context", session):
+            for path in component_paths(directory, tool_id, ".json"):
+                if not path.is_file():
+                    continue
+                context = json.loads(path.read_text(encoding="utf-8"))
+                if all(context.get(k, "") == v for k, v in (
+                        ("session_id", session), ("tool_use_id", tool_id),
+                        ("host_id", host), ("profile_id", profile))):
+                    return safe_id(context.get("turn_id"), "turn_id")
+        return ""
     except (OSError, ValueError, TypeError, AttributeError):
         return ""
 
@@ -712,12 +787,12 @@ def _md(value: Any) -> str:
 
 
 def _scope_slug(scope_id: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]+", "-", scope_id).strip("-") or "UNASSIGNED"
+    return file_component(scope_id)
 
 
 def _event_link(root: Path, view_path: Path, event: Dict[str, Any]) -> str:
     target = Path(event["_path"])
-    return os.path.relpath(target, view_path.parent)
+    return Path(os.path.relpath(target, view_path.parent)).as_posix()
 
 
 def _write_view(path: Path, text: str) -> None:
@@ -834,7 +909,7 @@ def work_cards(events: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def _card_link(root: Path, view: Path, card: Dict[str, Any]) -> str:
     if card["view_name"]:
-        return os.path.relpath(root / "views" / "by-work" / card["view_name"], view.parent)
+        return Path(os.path.relpath(root / "views" / "by-work" / card["view_name"], view.parent)).as_posix()
     return _event_link(root, view, card["_events"][-1])
 
 
@@ -959,6 +1034,9 @@ def render_views(root: Path) -> Dict[str, Any]:
         current_scope_files = {f"{_scope_slug(scope)}.md" for scope in by_scope}
         for old in (root / "views" / "by-scope").glob("*.md"):
             if old.name not in current_scope_files:
+                alias = old.with_name(old.name.lower())
+                if alias.name in current_scope_files and alias.samefile(old):
+                    continue  # An old uppercase name may be this same file on Windows/macOS.
                 _write_view(old, "# 对象归类已更新\n\n此派生页已停用；请从[当前事项索引](../02_事项索引_WORK_ITEMS.md)或[完整时间线](../00_全局变更时间线_CHANGELOG.md)重新查找。\n")
         for day, grouped in by_day.items():
             path = root / "views" / "daily" / f"{day}.md"
@@ -1282,10 +1360,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else:
             parser.error("unknown command")
             return 2
-        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True))
         return 1 if args.command == "doctor" and not result.get("ok") else 0
     except (JournalError, OSError, json.JSONDecodeError) as exc:
-        print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False), file=sys.stderr)
+        print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=True), file=sys.stderr)
         return 2
 
 

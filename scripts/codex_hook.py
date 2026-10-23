@@ -21,7 +21,9 @@ import change_journal as cj
 MAX_STDIN = 1_048_576
 MUTATING_SHELL_RE = re.compile(
     r"(?im)(?:^|[;&|]\s*|\n\s*)"
-    r"(?:mkdir|cp|mv|rm|touch|chmod|chown|ln|install|truncate|tee)\b|"
+    r"(?:mkdir|cp|mv|rm|touch|chmod|chown|ln|install|truncate|tee|"
+    r"Set-Content|Add-Content|Clear-Content|Out-File|New-Item|Set-Item|"
+    r"Copy-Item|Move-Item|Remove-Item|Rename-Item)\b|"
     r"\bsed\s+-i\b|"
     r"\bgit\s+(?:commit|merge|rebase|reset|clean|tag|switch|checkout)\b|"
     r"\b(?:pip3?|uv)\s+(?:install|uninstall|sync)\b|"
@@ -38,7 +40,7 @@ def _read_payload() -> Dict[str, Any]:
     raw = sys.stdin.buffer.read(MAX_STDIN + 1)
     if len(raw) > MAX_STDIN:
         raise cj.JournalError("hook payload exceeds size limit")
-    payload = json.loads(raw.decode("utf-8"))
+    payload = json.loads(raw.decode("utf-8-sig"))
     if not isinstance(payload, dict):
         raise cj.JournalError("hook payload must be an object")
     return payload
@@ -57,7 +59,8 @@ def _payload_command(payload: Dict[str, Any]) -> str:
 
 
 def _is_self_command(command: str) -> bool:
-    return "change-journal/scripts/change_journal.py" in command or "change-journal/scripts/codex_hook.py" in command
+    normalised = command.replace("\\", "/").lower()
+    return "change-journal/scripts/change_journal.py" in normalised or "change-journal/scripts/codex_hook.py" in normalised
 
 
 def _mutation_category(tool_name: str, command: str) -> str:
@@ -80,13 +83,8 @@ def _normalise_candidate(raw: str, cwd: str) -> Optional[str]:
     value = raw.strip().strip("'\"")
     if not value or value == "/dev/null":
         return None
-    candidate = Path(value).expanduser()
-    if not candidate.is_absolute():
-        if not cwd:
-            return None
-        candidate = Path(cwd) / candidate
     try:
-        return cj.safe_path(str(candidate), "hook path")
+        return cj.absolute_path(value, cwd)
     except cj.JournalError:
         return None
 
@@ -131,7 +129,7 @@ def _safe_hook_ids(payload: Dict[str, Any]) -> Tuple[str, str]:
 
 
 def _turn_dir(root: Path, session: str, turn: str) -> Path:
-    return root / ".spool" / "codex" / session / turn
+    return root / ".spool" / "codex" / cj.file_component(session) / cj.file_component(turn)
 
 
 def capture_context(payload: Dict[str, Any], root: Path) -> None:
@@ -147,14 +145,22 @@ def capture_context(payload: Dict[str, Any], root: Path) -> None:
         "host_id": cj.safe_id(payload.get("host_id") or socket.gethostname(), "host_id"),
         "profile_id": cj.safe_id(payload.get("profile_id"), "profile_id"),
     }
-    cj._atomic_write(root / ".spool" / "codex-context" / session / f"{tool_id}.json", cj._json_bytes(context))
+    cj._atomic_write(root / ".spool" / "codex-context" / cj.file_component(session)
+                     / f"{cj.file_component(tool_id)}.json", cj._json_bytes(context))
 
 
 def _clear_context(payload: Dict[str, Any], root: Path) -> None:
     session = cj.safe_id(payload.get("session_id"), "session_id")
     tool_id = cj.safe_id(payload.get("tool_use_id"), "tool_use_id")
     if session and tool_id:
-        (root / ".spool" / "codex-context" / session / f"{tool_id}.json").unlink(missing_ok=True)
+        for directory in cj.component_paths(root / ".spool" / "codex-context", session):
+            for path in cj.component_paths(directory, tool_id, ".json"):
+                try:
+                    context = json.loads(path.read_text(encoding="utf-8"))
+                    if context.get("session_id") == session and context.get("tool_use_id") == tool_id:
+                        path.unlink(missing_ok=True)
+                except (OSError, ValueError, AttributeError):
+                    continue
 
 
 def observe(payload: Dict[str, Any], root: Path) -> None:
@@ -211,8 +217,9 @@ def _parse_utc(value: str) -> dt.datetime:
 
 def _matching_semantic_markers(root: Path, session: str, turn: str) -> List[Dict[str, Any]]:
     markers = []
-    marker_dir = root / ".spool" / "semantic" / session
-    for path in sorted(marker_dir.glob("*.json")):
+    marker_paths = {path for directory in cj.component_paths(root / ".spool" / "semantic", session)
+                    for path in directory.glob("*.json")}
+    for path in sorted(marker_paths):
         try:
             marker = json.loads(path.read_text(encoding="utf-8"))
             if marker.get("session_id") != session or marker.get("turn_id") != turn:
@@ -238,17 +245,19 @@ def _uncovered_observations(observations: Sequence[Dict[str, Any]], markers: Seq
         covered = set()
         for marker in markers:
             if any(marker.get(k, "") != item.get(k, "") for k in
-                   ("session_id", "turn_id", "cwd", "host_id", "profile_id")):
+                   ("session_id", "turn_id", "host_id", "profile_id")):
+                continue
+            if cj.path_key(marker.get("cwd", "")) != cj.path_key(item.get("cwd", "")):
                 continue
             if _parse_utc(marker["recorded_at"]) < _parse_utc(item["occurred_at"]):
                 continue
-            overlap = set(paths).intersection(marker.get("changed_paths", []))
+            overlap = {cj.path_key(p) for p in paths}.intersection(cj.path_key(p) for p in marker.get("changed_paths", []))
             if overlap:
                 covered.update(overlap)
                 used.add(marker["event_id"])
         # Unknown paths cannot be proved covered by a directory or time proximity.
-        if not paths or set(paths) - covered:
-            remaining.append(dict(item, changed_paths=[p for p in paths if p not in covered]))
+        if not paths or {cj.path_key(p) for p in paths} - covered:
+            remaining.append(dict(item, changed_paths=[p for p in paths if cj.path_key(p) not in covered]))
     return remaining, sorted(used)
 
 
@@ -258,7 +267,11 @@ def finalize(payload: Dict[str, Any], root: Path) -> None:
     finalized = turn_dir / ".finalized.json"
     if finalized.exists():
         return
-    observations = _load_observations(turn_dir)
+    observations = []
+    for session_dir in cj.component_paths(root / ".spool" / "codex", session):
+        for directory in cj.component_paths(session_dir, turn):
+            observations.extend(item for item in _load_observations(directory)
+                                if item.get("session_id", session) == session and item.get("turn_id", turn) == turn)
     if not observations:
         return
 

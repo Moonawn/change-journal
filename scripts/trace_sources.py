@@ -14,11 +14,15 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import ntpath
 import os
 import re
 import sqlite3
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from urllib.parse import unquote, urlsplit
+
+import change_journal as cj
 
 HOME = Path.home()
 CC_ROOT = HOME / ".claude" / "projects"
@@ -119,8 +123,22 @@ def _strip_file_uri(value: Any) -> str:
     """Codex 的 CommandExecution.cwd 是 file:// URI，其余地方是裸路径。"""
     text = str(value or "").strip()
     if text.startswith("file://"):
-        text = text[len("file://"):]
+        uri = urlsplit(text)
+        text = unquote(uri.path)
+        if uri.netloc and uri.netloc.lower() != "localhost":
+            text = "//" + uri.netloc + text
+        elif re.match(r"^/[A-Za-z]:/", text):
+            text = text[1:]
     return text
+
+
+def _changed_path(value: Any, cwd: str = "") -> str:
+    if not isinstance(value, str) or not value:
+        return ""
+    try:
+        return cj.absolute_path(_strip_file_uri(value), cwd)
+    except cj.JournalError:
+        return ""
 
 
 _SHELL_NAMES = {"zsh", "bash", "sh", "dash", "ksh"}
@@ -137,7 +155,7 @@ def _verb_from_script(script: str) -> str:
         if not match:
             return ""
         token = match.group(0)
-        name = os.path.basename(token) or token
+        name = ntpath.basename(token) or token
         if name in _NOOP_VERBS:
             separator = text.find("&&")
             if separator == -1:
@@ -157,7 +175,7 @@ def _command_verb(command: Any) -> str:
     if isinstance(command, (list, tuple)):
         if not command:
             return ""
-        head = os.path.basename(str(command[0])) or str(command[0])
+        head = ntpath.basename(str(command[0])) or str(command[0])
         if head in _SHELL_NAMES and len(command) >= 3 and str(command[1]) in _WRAPPER_FLAGS:
             return _verb_from_script(str(command[2]))
         if head in ("env", "sudo", "nohup", "time") and len(command) > 1:
@@ -278,8 +296,8 @@ def iter_claude_code(since: Optional[str] = None, start_offsets: Optional[Dict[s
                         continue
                     key = _CC_PATH_INPUT_KEYS.get(name)
                     if key:
-                        candidate = payload.get(key)
-                        if isinstance(candidate, str) and candidate.startswith("/"):
+                        candidate = _changed_path(payload.get(key), cwd)
+                        if candidate:
                             turn["changed_paths"].append(candidate)
                             turn["path_ops"]["update"].append(candidate)
                     elif name == "Bash":
@@ -374,7 +392,8 @@ def iter_codex(since: Optional[str] = None, start_offsets: Optional[Dict[str, in
             item_type = item.get("type")
             if item_type == "FileChange":
                 for path, detail in (item.get("changes") or {}).items():
-                    if not isinstance(path, str) or not path.startswith("/"):
+                    path = _changed_path(path, cwd)
+                    if not path:
                         continue
                     turn["changed_paths"].append(path)
                     op = "update"
@@ -487,8 +506,8 @@ def iter_cindy(since: Optional[str] = None, start_offsets: Optional[Dict[str, in
                     rel = entry.get("path")
                     if not isinstance(rel, str) or not rel:
                         continue
-                    absolute = rel if rel.startswith("/") else os.path.normpath(os.path.join(cwd, rel))
-                    if not absolute.startswith("/"):
+                    absolute = _changed_path(rel, cwd)
+                    if not absolute:
                         continue
                     record["changed_paths"].append(absolute)
                     record["path_ops"][op_map.get(str(entry.get("status") or "").lower(), "update")].append(absolute)

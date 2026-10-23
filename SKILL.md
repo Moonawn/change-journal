@@ -21,6 +21,8 @@ description: 记录持久变更及验证证据，按目标查询历史、明确�
 
 默认台账位于 `~/.local/share/change-journal`，可用 `CHANGE_JOURNAL_ROOT` 或全局 `--root` 参数指定。首次运行 `python3 <Skill目录>/scripts/change_journal.py init`；实际安装位置不同时调整下方脚本路径。对象路由按需维护在台账的 `registry.json`。
 
+支持 macOS、Linux 和 Windows，Python 3.9+。Windows 使用 `python` 或 `py -3`；PowerShell 续行用反引号，路径带空格时加引号，完整示例见 [README.md](README.md#使用)。
+
 验证完成后、最终回复前调用一次；`--render` 同时更新视图：
 
 ```bash

@@ -18,7 +18,7 @@ def read_payload() -> Dict[str, Any]:
     raw = sys.stdin.buffer.read(MAX_STDIN + 1)
     if len(raw) > MAX_STDIN:
         raise cj.JournalError("Hermes adapter payload exceeds size limit")
-    payload = json.loads(raw.decode("utf-8"))
+    payload = json.loads(raw.decode("utf-8-sig"))
     if not isinstance(payload, dict):
         raise cj.JournalError("Hermes adapter payload must be an object")
     return payload
@@ -97,10 +97,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     try:
         result = record_payload(read_payload(), cj.root_from(args.root))
-        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True))
         return 0
     except (cj.JournalError, OSError, json.JSONDecodeError) as exc:
-        print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False), file=sys.stderr)
+        print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=True), file=sys.stderr)
         return 2
 
 

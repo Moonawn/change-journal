@@ -57,7 +57,7 @@ class ReliabilityTests(unittest.TestCase):
         self.assertTrue(result["duplicate"])
         self.assertEqual(result["work_title"], "Original task")
         self.assertEqual(before, self.facts())
-        self.assertEqual(json.loads(self.ref().read_text())["event_id"], result["event_id"])
+        self.assertEqual(json.loads(self.ref().read_text(encoding="utf-8"))["event_id"], result["event_id"])
         self.assertTrue(cj.doctor(self.root)["ok"])
 
     def test_retry_after_semantic_marker_failure_rebuilds_marker(self):
@@ -66,7 +66,7 @@ class ReliabilityTests(unittest.TestCase):
         before = self.facts()
         result = self.record(idempotency_key="same-key", turn_id="unrelated-retry")
         marker_path = self.root / ".spool/semantic/session-a" / (result["event_id"] + ".json")
-        self.assertEqual(json.loads(marker_path.read_text())["turn_id"], "turn-a")
+        self.assertEqual(json.loads(marker_path.read_text(encoding="utf-8"))["turn_id"], "turn-a")
         mtime = marker_path.stat().st_mtime_ns
         self.record(idempotency_key="same-key")
         self.assertEqual(mtime, marker_path.stat().st_mtime_ns)
@@ -81,7 +81,7 @@ class ReliabilityTests(unittest.TestCase):
                 if content is None:
                     self.ref().unlink()
                 else:
-                    self.ref().write_text(content)
+                    self.ref().write_text(content, encoding="utf-8")
                 self.assertFalse(cj.doctor(self.root)["ok"])
                 result = self.record(idempotency_key="same-key")
                 self.assertEqual(result["event_id"], first["event_id"])
@@ -89,7 +89,7 @@ class ReliabilityTests(unittest.TestCase):
         self.assertEqual(before, self.facts())
 
     def test_dangling_index_without_fact_does_not_report_false_success(self):
-        self.ref().write_text('{"event_id":"missing"}')
+        self.ref().write_text('{"event_id":"missing"}', encoding="utf-8")
         with self.assertRaisesRegex(cj.JournalError, "no matching fact"):
             self.record(idempotency_key="same-key")
         self.assertEqual(self.facts(), {})
@@ -98,9 +98,9 @@ class ReliabilityTests(unittest.TestCase):
         first = self.record(idempotency_key="same-key")
         second = self.record()
         path = Path(second["event_path"])
-        data = json.loads(path.read_text())
-        data["idempotency_key_hash"] = json.loads(Path(first["event_path"]).read_text())["idempotency_key_hash"]
-        path.write_text(json.dumps(data))  # Simulate an old interrupted-write duplicate.
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["idempotency_key_hash"] = json.loads(Path(first["event_path"]).read_text(encoding="utf-8"))["idempotency_key_hash"]
+        path.write_text(json.dumps(data), encoding="utf-8")  # Simulate an old interrupted-write duplicate.
         self.assertTrue(any("duplicate idempotency key" in i for i in cj.doctor(self.root)["issues"]))
         self.ref().unlink()
         before = self.facts()
@@ -145,18 +145,18 @@ class ReliabilityTests(unittest.TestCase):
         registry = cj.default_registry()
         routes = [dict(path="/workspace/project/", scope_id="ONE"), dict(path="/workspace/project", scope_id="TWO")]
         for ordered in (routes, list(reversed(routes))):
-            (self.root / "registry.json").write_text(json.dumps(dict(registry, routes=ordered)))
+            (self.root / "registry.json").write_text(json.dumps(dict(registry, routes=ordered)), encoding="utf-8")
             self.assertFalse(cj.doctor(self.root)["ok"])
             with self.assertRaisesRegex(cj.JournalError, "conflicting scopes"):
                 cj.route_scope(self.root, primary_path="/workspace/project")
             result = self.record(scope_id="")
             self.assertTrue(result["warnings"])
-            self.assertEqual(json.loads(Path(result["event_path"]).read_text())["scope_id"], "UNASSIGNED")
+            self.assertEqual(json.loads(Path(result["event_path"]).read_text(encoding="utf-8"))["scope_id"], "UNASSIGNED")
 
     def test_equal_length_target_ambiguity_can_be_resolved_by_primary_path(self):
         registry = cj.default_registry()
         registry["routes"] = [dict(path="/workspace/a", scope_id="ONE"), dict(path="/workspace/b", scope_id="TWO")]
-        (self.root / "registry.json").write_text(json.dumps(registry))
+        (self.root / "registry.json").write_text(json.dumps(registry), encoding="utf-8")
         with self.assertRaisesRegex(cj.JournalError, "ambiguous target scopes"):
             cj.route_scope(self.root, changed_paths=["/workspace/a/file", "/workspace/b/file"])
         self.assertEqual(cj.route_scope(self.root, primary_path="/workspace/b"), "TWO")
@@ -167,7 +167,7 @@ class ReliabilityTests(unittest.TestCase):
         cj.render_views(self.root)
         view = self.root / "views/00_待续接_CONTINUATIONS.md"
         before = view.read_bytes()
-        Path(closed["event_path"]).write_text("{broken")
+        Path(closed["event_path"]).write_text("{broken", encoding="utf-8")
         result = cj.query_events(self.root, scope_id="PROJECT")
         self.assertTrue(result["partial"])
         self.assertEqual(result["events"][0]["event_id"], old["event_id"])
@@ -181,14 +181,14 @@ class ReliabilityTests(unittest.TestCase):
 
     def test_invalid_json_shapes_are_reported_without_diagnostic_crashes(self):
         valid = self.record()
-        data = json.loads(Path(valid["event_path"]).read_text())
+        data = json.loads(Path(valid["event_path"]).read_text(encoding="utf-8"))
         bad_path = Path(valid["event_path"]).parent / "bad.json"
         values = [[], None, {}, dict(data, verification=[]), dict(data, verification={"status": []}),
                   dict(data, phase=[]), dict(data, schema_version=[]), dict(data, scope_id=[]),
                   dict(data, occurred_at="no-date"), dict(data, lesson=[]), dict(data, changed_paths="bad")]
         for value in values:
             with self.subTest(value=value):
-                bad_path.write_text(json.dumps(value))
+                bad_path.write_text(json.dumps(value), encoding="utf-8")
                 self.assertFalse(cj.doctor(self.root)["ok"])
                 result = cj.query_events(self.root, scope_id="PROJECT")
                 self.assertTrue(result["partial"])
@@ -219,7 +219,7 @@ class ReliabilityTests(unittest.TestCase):
         self.assertEqual(latest["work_title"], "New title")
         self.assertEqual(result["work_items"][0]["latest_event_id"], latest["event_id"])
         cj.render_views(self.root)
-        text = (self.root / "views/00_全局变更时间线_CHANGELOG.md").read_text()
+        text = (self.root / "views/00_全局变更时间线_CHANGELOG.md").read_text(encoding="utf-8")
         self.assertLess(text.index("20261022010000-aaa"), text.index("20261022010000-zzz"))
 
     def test_order_normalizes_precision_timezones_and_missing_recorded_time(self):
@@ -247,7 +247,7 @@ class ReliabilityTests(unittest.TestCase):
         old_bytes = Path(old["event_path"]).read_bytes()
         (self.root / "work-items.json").write_text(json.dumps({"schema_version": "1.0", "items": [
             dict(work_id="task", title="Corrected task", scope_id="PROJECT", host_id="host-a", profile_id="personal",
-                 event_ids=[old["event_id"]])]}))
+                 event_ids=[old["event_id"]])]}), encoding="utf-8")
         result = self.record(resolves_event_ids=[old["event_id"]])
         self.assertEqual(result["work_id"], "task")
         self.assertEqual(cj.status(self.root)["pending"], 0)
@@ -289,7 +289,7 @@ class ReliabilityTests(unittest.TestCase):
         self.record()
         self.record(changed_paths=["/workspace/project/b.md"])
         self.assertEqual(self.stop(), [])
-        final = json.loads((self.root / ".spool/codex/session-a/turn-a/.finalized.json").read_text())
+        final = json.loads((self.root / ".spool/codex/session-a/turn-a/.finalized.json").read_text(encoding="utf-8"))
         self.assertEqual(len(final["event_ids"]), 2)
 
     def test_semantic_event_before_later_same_path_mutation_cannot_suppress_it(self):

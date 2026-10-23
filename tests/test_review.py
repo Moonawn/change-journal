@@ -35,11 +35,11 @@ class ReviewTests(unittest.TestCase):
     def legacy(self, **kw):
         result = self.record(**kw)
         path = Path(result["event_path"])
-        event = json.loads(path.read_text())
+        event = json.loads(path.read_text(encoding="utf-8"))
         event["schema_version"] = "1.0"
         for key in ("follow_ups", "limitations", "resolves_event_ids", "supersedes_event_ids", "lesson"):
             event.pop(key, None)
-        path.write_text(json.dumps(event))
+        path.write_text(json.dumps(event), encoding="utf-8")
         return result
 
     def test_only_explicit_actions_are_pending(self):
@@ -81,7 +81,7 @@ class ReviewTests(unittest.TestCase):
         registry = cj.default_registry()
         registry["routes"].append({"path": "/workspace/project", "scope_id": "EXAMPLE-PROJECT"})
         registry["routes"].append({"path": str(self.root), "scope_id": "CHANGE-JOURNAL"})
-        (self.root / "registry.json").write_text(json.dumps(registry))
+        (self.root / "registry.json").write_text(json.dumps(registry), encoding="utf-8")
         backup = str(self.root / "备份_BACKUPS" / "file.bak")
         target = "/workspace/project/project/file.md"
         self.assertEqual(cj.route_scope(self.root, "/workspace/skills/change-journal",
@@ -117,7 +117,7 @@ class ReviewTests(unittest.TestCase):
         for n in range(15):
             self.record(summary=f"change-{n:02}", occurred_at=f"2026-10-15T17:{n:02}:00Z")
         result = cj.render_views(self.root)
-        text = Path(result["review_view"]).read_text()
+        text = Path(result["review_view"]).read_text(encoding="utf-8")
         self.assertIn("change-14", text)
         self.assertNotIn("change-00", text)
         self.assertTrue((self.root / "views" / "daily" / "2026-10-16.md").exists())
@@ -165,12 +165,12 @@ class ReviewTests(unittest.TestCase):
     def test_old_hook_spool_and_new_adapter_fields(self):
         spool = self.root / ".spool" / "fixture"
         spool.mkdir(parents=True)
-        (spool / "old.json").write_text(json.dumps({"schema_version": "1.0", "category": "file_mutation"}))
+        (spool / "old.json").write_text(json.dumps({"schema_version": "1.0", "category": "file_mutation"}), encoding="utf-8")
         self.assertEqual(len(hook._load_observations(spool)), 1)
         result = hermes.record_payload(dict(profile_id="profile-a", external_event_id="once", phase="applied",
             summary="Hermes change", record_level="full", kind="runtime",
             primary_path="/workspace/project/project", follow_ups=["check load"], limitations=["no external post"]), self.root)
-        event = json.loads(Path(result["event_path"]).read_text())
+        event = json.loads(Path(result["event_path"]).read_text(encoding="utf-8"))
         self.assertEqual(event["follow_ups"], ["check load"])
         self.assertEqual(event["record_level"], "full")
 
