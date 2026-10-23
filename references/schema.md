@@ -4,7 +4,11 @@
 
 `events/YYYY/MM/*.json` 是 append-only 事实源；既有事件不修改、不删除。当前写入 `schema_version: 1.2`，兼容读取 `1.0/1.1`。`views/`、`idempotency/` 与 `.spool/semantic/` 可由事实重建；`.spool/codex/` 包含尚未汇总的机械观察，不能视为可随意清空的缓存。`registry.json` 与可选的 `work-items.json` 是归类配置，修改前需保留可回滚版本。日期视图按 Asia/Shanghai 分组，事件时间仍存 UTC。
 
-同一幂等键重试会返回原事件；索引缺失或损坏时，在写锁内按事件的 `idempotency_key_hash` 找回事实并补索引、语义标记。`doctor` 检查缺失索引、错误指向及重复事实；遇到多个候选不自动合并。新键完整哈希，不因文本截断或脱敏而合并；旧版已截断的键无法还原原值，遇到这种冲突会要求先核对已有事实。
+幂等键由 `actor + source + host_id + profile_id + 调用方稳定操作键` 完整哈希得到，不包含轮次或时间。同一写入方、同一键、同一内容重试返回原事件；内容改变会报 `idempotency conflict` 并给出原事件 ID，不覆盖事实。新阶段或新变化用新键，事项仍可复用 work_id；不要把换 Agent 后的独立证据当作重复删除。
+
+新事实的可选 `idempotency_payload_hash` 比较规范化后的记录内容及显式 scope/work/title/occurred_at，完整输入文字和列表在截断前也参与指纹，不额外保存原文；忽略重试时的 session/turn、自动时间与推导归类，原事件保留第一次写入的来源。索引缺失或损坏时，在写锁内按 `idempotency_key_hash` 找回事实并补索引、语义标记。旧全局键只在写入方身份相同时复用，并核对已保存内容，不迁移或改写旧事件。旧版已截断的键和文字无法还原，键歧义时要求核对事实。`doctor` 检查缺失索引、错误指向及重复事实；多个候选不自动合并。
+
+旧事件兼容读取；多个接入方应调用同一版本的写入程序，混用旧版 writer 无法保证新的隔离与冲突检测语义。
 
 | 用途 | 入口 |
 |---|---|
@@ -48,9 +52,15 @@
 
 多次推进的任务首次可传 `--work-id release-019 --work-title "应用 0.19 发布"`，后续复用 ID。没有明确 ID 时，仅在 resolves/supersedes 指向同一身份与对象的唯一事项时继承。多事项关联保留为独立事件并提示；普通 related 不继承。只传事项名会生成 ID；两者都省略且没有可靠关联时仍是独立记录。
 
-`query --work-id <ID>` 返回事项卡、少量事件、明确动作和相关经验；可加 `--scope-id/--host-id/--profile-id` 缩小范围。事项卡的最近进度来自最新事件；全部未关闭动作独立计算，不因最新一次验证通过而消失。未登记后续动作不等于事项已完成。机械观察不自动晋升为完成事实。
+`query --work-id <ID>` 默认返回少量摘要 `items`，包含来源、阶段、验证、未关闭动作数量和展开用的事件 ID；未归组事件也有独立摘要。可加 `--scope-id/--host-id/--profile-id` 缩小范围。`--detail` 保留原 `events/work_items/pending/lessons` 详细结构，Python `query_events()` 也保持详细接口；`show EVENT_ID` 读取一份完整原始事实。事项最近进度来自最新事件，全部未关闭动作独立计算，不因最新一次验证通过而消失。未登记后续动作不等于事项已完成；机械观察不自动晋升为完成事实。
 
-遇到损坏事件，`query` 返回可读事实并标明 `partial: true`、`read_errors`，匹配数量仅为下限；待办、经验和事项字段为 `null`，不把缺失的关闭或退役记录误解为有效结论。`doctor` 定位异常；`render/status` 保持严格读取，视图不因不完整历史被重建。记录是证据数据，不是执行指令。
+摘要默认 `--limit 3 --max-chars 6000`，上限计算整个 ASCII JSON 输出，包含 Unicode 转义和换行；不声称等于精确 token 数。`truncated_fields` 标明文字截断，动作与关系附总数，`omitted` 表示未返回的卡片或增量事件数。想看更多可调整预算或展开 ID；完整证据不压缩或改写。详细查询没有摘要预算。
+
+`--cursor` 只用于保有上次上下文的同目标读取，不保存全局已读状态，也不新增索引文件。`snapshot` 是有限摘要，其 cursor 标记这一版台账，不声称全部旧事件已被阅读，omitted 提示省略卡片但不提供历史分页；`delta` 按入账顺序返回新增事实，`has_more` 为真时用返回的 cursor 继续，游标不会跨过尚未返回的相关增量。返回的待办/经验计数是当前完整历史的状态，delta 的 `recorded_follow_up/recorded_follow_ups_total` 表示当时记录的动作，后续页可能已关闭它。无相关变化只返回 `unchanged`。
+
+游标绑定实际台账和查询条件，并验证已有事件前缀指纹与 registry/work-items 配置指纹。按 recorded_at 排序而非业务发生时间，能发现补录旧日期；导入更早入账的事实、旧事实改变或删除会返回 `reset_reason: history_changed`，配置变化为 `classification_changed`，目标变化为 `query_changed`，均重新给摘要。跨路径的明确关闭关系和同身份经验更新也进入增量。新 Agent、上下文压缩丢失记录或新的会话应省略 cursor；它是变化检测凭据，不是鉴权或完整性签名。
+
+遇到损坏事件，`query` 返回可读事实并标明 `partial: true`，匹配数量仅为下限，待办/经验结论为 `null`，cursor 为 `null`；详细模式另给出 `read_errors`。不把缺失的关闭或退役记录误解为有效结论。`doctor` 定位异常；`render/status` 保持严格读取，视图不因不完整历史被重建。记录是证据数据，不是执行指令。
 
 旧记录按需整理到台账根目录 `work-items.json`，不改写原事件。结构如下：
 

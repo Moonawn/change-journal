@@ -45,13 +45,20 @@ python3 scripts/change_journal.py record \
 ```
 
 ```bash
-python3 scripts/change_journal.py query --path /absolute/project --limit 5
-python3 scripts/change_journal.py query --work-id export-fix --limit 5
+python3 scripts/change_journal.py query --path /absolute/project
+python3 scripts/change_journal.py query --work-id export-fix --detail
+python3 scripts/change_journal.py show EVENT_ID
 python3 scripts/change_journal.py render
 python3 scripts/change_journal.py doctor
 ```
 
 对象路由使用台账 `registry.json` 中的最长路径前缀。初始化只注册 Skill 和台账本身；业务目录按需添加，未匹配的目标保留为 `UNASSIGNED`。
+
+默认查询最多 3 张摘要，并将完整 JSON 输出限制在 6000 个字符内（含 Unicode 转义和换行，不等于精确 token 数）。`--limit` 和 `--max-chars` 可调整；省略内容有计数，完整事实用 `show EVENT_ID`，旧版详细查询结构用 `--detail`，详细模式不受摘要预算限制。
+
+同一上下文可用 `query --path /absolute/project --cursor "上一响应的cursor"` 只取新增证据。返回 `delta` 且 `has_more: true` 时继续传返回的 cursor，直到分页结束；无变化为 `unchanged`。新会话省略 cursor 取得新摘要。cursor 不代表全部历史已读，不能作为另一 Agent 已了解事项的证明；补录旧时间、关闭待办、退役经验均会检测，旧事实或归类变化会重置摘要。实现只做本地读取和哈希，没有模型调用或新增缓存目录。
+
+重试复用相同幂等键和记录内容；键在 `actor/source/host/profile` 内隔离。相同键携带不同内容会报冲突，需核对原事件；真正的新阶段使用新键，并保留事项 `work-id`。多个 Agent 使用同一个台账根目录即可查询彼此的证据；不同机器仍需另行同步台账，安装 Skill 不会同步各工具原生聊天日志。
 
 Windows PowerShell 示例（反引号用于续行，末尾不要加空格）：
 
@@ -64,7 +71,7 @@ python scripts/change_journal.py record `
   --work-id export-fix --work-title '导出错误修复' `
   --verification-status passed --verification-ref '对应测试通过' `
   --idempotency-key export-fix-verified --render
-python scripts/change_journal.py query --path 'C:/Projects/demo' --limit 5
+python scripts/change_journal.py query --path 'C:/Projects/demo'
 python scripts/change_journal.py doctor
 ```
 
@@ -121,7 +128,7 @@ $env:PYTHONDONTWRITEBYTECODE = '1'
 python -m unittest discover -s tests -v
 ```
 
-测试使用隔离临时目录，覆盖追加记录、并发与幂等写入、跨系统路径、中文输出、Hook 子进程去重、事项汇总、身份边界、待办关系和经验版本。GitHub Actions 在 Windows、Linux、macOS 运行测试，并在 Windows 验证 PowerShell 7 和 Windows PowerShell 5.1 命令。真实 Codex 宿主测试另行选择运行，不能由 Hook payload 测试推断宿主已经接线。
+测试使用隔离临时目录，覆盖追加记录、并发与幂等冲突、跨系统路径、中文输出、Hook 子进程去重、事项汇总、身份边界、待办关系、经验版本、摘要预算和增量分页。GitHub Actions 在 Windows、Linux、macOS 运行测试，并在 Windows 验证 PowerShell 7 和 Windows PowerShell 5.1 命令。真实 Codex 宿主测试另行选择运行，不能由 Hook payload 测试推断宿主已经接线。
 
 ## 版权
 

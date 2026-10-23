@@ -41,16 +41,21 @@ python3 "$HOME/.agents/skills/change-journal/scripts/change_journal.py" record \
 - 普通关联用 `--related-event-id`；全部解决旧事件的待办用 `--resolves-event-id`；部分接手用 `--supersedes-event-id` 并列出仍未完成的动作。不得因新增关联就宣称已解决。
 - `applied` 表示已写入；`verified` 要有实际检查或测试；`active` 还要有运行态加载证据。文档可用差异、链接或内容核对验证。局部通过时说明范围，不宣称整体通过。
 - 事件保存成功、视图更新失败时只重试 `render`。记录本身失败则说明留痕缺口，使用同一幂等键补记，不重复执行业务变更。
+- 幂等键在 `actor/source/host/profile` 内标识同一次操作；同键同内容返回原事件，内容改变会报冲突。新阶段用新键，同一事项继续复用 `work-id`，不要靠换写法或相似摘要去重。
 
 ## 按需查询与复用
 
 遇到续接、复发问题或需要复用历史经验时，按具体目标读取，默认返回少量相关项：
 
 ```bash
-python3 "$HOME/.agents/skills/change-journal/scripts/change_journal.py" query --path /absolute/target --limit 5
+python3 "$HOME/.agents/skills/change-journal/scripts/change_journal.py" query --path /absolute/target
 ```
 
-人工审阅从台账 `views/00_审阅入口_REVIEW.md` 开始，默认按事项汇总最近 8 项；展开事项卡查看全部依据。续接可用 `query --work-id <ID>`，跨身份同名事项分别返回。查询若标为 `partial`，只使用已读事实，先用 `doctor` 定位缺失证据，不据此判定待办或经验状态。事实、明确待办、历史待核和经验分开显示；最新记录不等于整件事完成，旧状态仍需结合当前证据核实。
+默认最多 3 张摘要，总输出最多 6000 个 ASCII JSON 字符；省略数量和截断字段会标明。按 `show EVENT_ID` 取完整事实，`query --work-id ID --detail` 展开事项、动作和经验。已有程序解析旧查询结构时加 `--detail`。
+
+同一上下文再次查询相同目标，可传上次的 `--cursor`：无变化只返回 `unchanged`，有变化按页返回 `delta`；`delta.has_more` 为真时沿返回的 cursor 继续。cursor 只是快照检查点，不表示旧历史全已阅读；新会话或丢失上下文时省略它，重新取摘要。归类或旧历史变化会明确重置摘要；`partial` 时不推进 cursor，先用 `doctor` 定位异常，不据此判定待办或经验状态。
+
+人工审阅从 `views/00_审阅入口_REVIEW.md` 开始，默认按事项汇总最近 8 项；展开事项卡查看全部依据。跨身份同名事项分别返回。最新记录不等于整件事完成，旧状态仍需结合当前证据核实。
 
 只有已经核实、下次遇到相同条件确实有用的教训，才附加一条 `lesson`（适用条件＋具体检查＋原事件证据）；普通成功不必总结经验。同一 scope/host/profile/key 更新或退役，避免不断追加同义教条。仅在需要记录经验、纠正历史归类、关联状态或接入适配器时读 [schema.md](references/schema.md)。
 

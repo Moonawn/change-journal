@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import datetime as dt
 import errno
@@ -478,6 +479,53 @@ def _idempotent_event(root: Path, key_hash: str) -> Optional[Dict[str, Any]]:
     return event
 
 
+def _producer(event: Dict[str, Any]) -> Tuple[str, ...]:
+    return tuple(event.get(k, "") for k in ("actor", "source", "host_id", "profile_id"))
+
+
+def idempotency_hash(key: str, actor: str, source: str, host_id: str, profile_id: str = "") -> str:
+    # A producer's operation ID is stable across sessions/turns, but not global.
+    return hashlib.sha256(_json_bytes(["producer-v1", actor, source, host_id, profile_id, key.strip()])).hexdigest()
+
+
+def _request_payload(event: Dict[str, Any]) -> Dict[str, Any]:
+    keys = ("phase", "summary", "why", "cwd", "changed_paths", "verification", "rollback_ref",
+            "unresolved", "related_event_ids", "tags", "sensitivity", "record_level", "kind",
+            "primary_path", "follow_ups", "limitations", "resolves_event_ids", "supersedes_event_ids", "lesson")
+    defaults = {k: [] for k in ("changed_paths", "unresolved", "related_event_ids", "tags", "follow_ups",
+                                "limitations", "resolves_event_ids", "supersedes_event_ids")}
+    defaults.update(lesson={}, record_level="brief", sensitivity="private")
+    result = {k: event.get(k, defaults.get(k, "")) for k in keys}
+    for k in ("cwd", "primary_path"):
+        result[k] = path_key(result[k])
+    result["changed_paths"] = sorted(set(path_key(p) for p in result["changed_paths"]))
+    return result
+
+
+def _full_content_hash(values: Sequence[Any]) -> str:
+    """Fingerprint full normalized input before display limits, without storing raw text."""
+    def normalize(value):
+        if isinstance(value, (list, tuple)):
+            return [normalize(v) for v in value]
+        text = "" if value is None else str(value)
+        return safe_text(text, "idempotency payload", len(text) + 1)[0]
+    return hashlib.sha256(_json_bytes(normalize(values))).hexdigest()
+
+
+def _check_retry(existing: Dict[str, Any], request: Dict[str, Any], payload_hash: str) -> None:
+    if existing.get("idempotency_payload_hash"):
+        equal = existing["idempotency_payload_hash"] == payload_hash
+    else:
+        # Old facts lack the original request (auto routing/title/time may differ).
+        # Compare stored meaning, plus every explicitly requested optional field.
+        equal = _request_payload(existing) == {k: request[k] for k in _request_payload(existing)}
+        equal = equal and all(not request[k] or request[k] == existing.get(k, "")
+                              for k in ("scope_id", "work_id", "work_title", "occurred_at"))
+    if not equal:
+        raise JournalError(f"idempotency conflict with event {existing['event_id']}: payload changed; "
+                           "inspect with show; use a new key for a new change")
+
+
 def _validate_lifecycle_targets(root: Path, event: Dict[str, Any]) -> None:
     targets = set(event["resolves_event_ids"] + event["supersedes_event_ids"])
     if not targets:
@@ -592,6 +640,14 @@ def record_event(
     work_title: str = "",
 ) -> Dict[str, Any]:
     init_root(root)
+    input_hash = ""
+    if idempotency_key:
+        input_hash = _full_content_hash([
+            summary, why, rollback_ref, work_title, lesson_trigger, lesson_check,
+            list(verification_refs), list(unresolved), list(follow_ups), list(limitations), list(tags),
+            sorted(set(path_key(safe_path(p, "changed_path")) for p in changed_paths)),
+            list(related_event_ids), list(resolves_event_ids), list(supersedes_event_ids),
+        ])
     actor = safe_id(actor, "actor")
     source = safe_id(source, "source")
     if phase not in PHASES:
@@ -677,31 +733,17 @@ def record_event(
             quality_notes.append(f"对象路由不可用（{type(exc).__name__}）；已保留事实，scope 为 UNASSIGNED。检查 registry.json 或明确主目标")
 
     key_hash = ""
-    legacy_key_hash = ""
+    legacy_hashes = []
     if idempotency_key:
         clean_key, _ = safe_text(idempotency_key, "idempotency_key", 300)
         if not clean_key:
             raise JournalError("idempotency_key must not be blank")
         # Hash the full key; display redaction/truncation must not merge operations.
-        key_hash = hashlib.sha256(idempotency_key.strip().encode("utf-8")).hexdigest()
-        legacy_key_hash = hashlib.sha256(clean_key.encode("utf-8")).hexdigest()
+        key_hash = idempotency_hash(idempotency_key, actor, source, effective_host, effective_profile)
+        legacy_hashes = list(dict.fromkeys(hashlib.sha256(v.encode("utf-8")).hexdigest()
+                                          for v in (idempotency_key.strip(), clean_key)))
 
     with journal_lock(root):
-        if key_hash:
-            existing = _idempotent_event(root, key_hash)
-            if existing:
-                _semantic_marker(root, existing)
-                return {
-                    "event_id": existing["event_id"],
-                    "event_path": existing["_path"],
-                    "duplicate": True,
-                    "work_id": existing.get("work_id", ""),
-                    "work_title": existing.get("work_title", ""),
-                    "warnings": existing.get("quality_notes", []),
-                }
-            if legacy_key_hash != key_hash and _idempotent_event(root, legacy_key_hash):
-                raise JournalError("legacy idempotency key was transformed; inspect the existing fact before choosing a new key")
-
         event = {
             "schema_version": SCHEMA_VERSION,
             "event_id": _event_id(timestamp),
@@ -739,6 +781,31 @@ def record_event(
             "work_id": "",
             "work_title": "",
         }
+        if key_hash:
+            request = dict(_request_payload(event), scope_id=effective_scope if scope_id else "", work_id=work_id, work_title=work_title,
+                           occurred_at=timestamp if occurred_at else "", input_hash=input_hash)
+            payload_hash = hashlib.sha256(_json_bytes(request)).hexdigest()
+            event["idempotency_payload_hash"] = payload_hash
+            existing = _idempotent_event(root, key_hash)
+            if not existing:
+                for index, legacy_hash in enumerate(legacy_hashes):
+                    candidate = _idempotent_event(root, legacy_hash)
+                    if candidate and _producer(candidate) == _producer(event):
+                        if index:
+                            raise JournalError("legacy idempotency key was transformed; inspect the existing fact before choosing a new key")
+                        existing = candidate
+                        break
+            if existing:
+                _check_retry(existing, request, payload_hash)
+                _semantic_marker(root, existing)
+                return {
+                    "event_id": existing["event_id"],
+                    "event_path": existing["_path"],
+                    "duplicate": True,
+                    "work_id": existing.get("work_id", ""),
+                    "work_title": existing.get("work_title", ""),
+                    "warnings": existing.get("quality_notes", []),
+                }
         try:
             _assign_work(root, event, work_id, work_title)
         except (JournalError, OSError, json.JSONDecodeError) as exc:
@@ -1094,9 +1161,10 @@ def validate_event(event: Dict[str, Any]) -> List[str]:
     lesson = event.get("lesson", {})
     if not isinstance(lesson, dict) or (lesson and any(not isinstance(lesson.get(k), str) for k in ("key", "trigger", "check", "status"))):
         issues.append("invalid lesson")
-    key_hash = event.get("idempotency_key_hash", "")
-    if not isinstance(key_hash, str) or (key_hash and not re.fullmatch(r"[0-9a-f]{64}", key_hash)):
-        issues.append("invalid idempotency_key_hash")
+    for field in ("idempotency_key_hash", "idempotency_payload_hash"):
+        key_hash = event.get(field, "")
+        if not isinstance(key_hash, str) or (key_hash and not re.fullmatch(r"[0-9a-f]{64}", key_hash)):
+            issues.append(f"invalid {field}")
     if event.get("work_id") and not SAFE_ID_RE.fullmatch(str(event["work_id"])):
         issues.append("invalid work_id")
     verification = event.get("verification", {})
@@ -1185,8 +1253,7 @@ def status(root: Path) -> Dict[str, Any]:
     }
 
 
-def query_events(root: Path, path: str = "", scope_id: str = "", profile_id: str = "", limit: int = 5,
-                 work_id: str = "", host_id: str = "") -> Dict[str, Any]:
+def _query_filter(path: str, scope_id: str, profile_id: str, work_id: str, host_id: str):
     if not path and not scope_id and not work_id:
         raise JournalError("query requires --path, --scope-id or --work-id")
     target = safe_path(path) if path else ""
@@ -1194,10 +1261,6 @@ def query_events(root: Path, path: str = "", scope_id: str = "", profile_id: str
     profile = safe_id(profile_id, "profile_id") if profile_id else ""
     work = safe_id(work_id, "work_id") if work_id else ""
     host = safe_id(host_id, "host_id") if host_id else ""
-    if not 1 <= limit <= 50:
-        raise JournalError("limit must be between 1 and 50")
-    read_errors: List[Dict[str, str]] = []
-    events = project_events(root, load_events(root, errors=read_errors))
     def matches(e):
         if scope and e.get("scope_id") != scope:
             return False
@@ -1209,8 +1272,19 @@ def query_events(root: Path, path: str = "", scope_id: str = "", profile_id: str
             return False
         paths = [e.get("primary_path", ""), *e.get("changed_paths", [])]
         return not target or any(p and (_within(p, target) or _within(target, p)) for p in paths)
+    return matches, (path_key(target), scope, profile, work, host)
+
+
+def query_events(root: Path, path: str = "", scope_id: str = "", profile_id: str = "", limit: int = 5,
+                 work_id: str = "", host_id: str = "") -> Dict[str, Any]:
+    """Detailed, backwards-compatible Python API; the CLI defaults to compact_query."""
+    matches, _ = _query_filter(path, scope_id, profile_id, work_id, host_id)
+    if not 1 <= limit <= 50:
+        raise JournalError("limit must be between 1 and 50")
+    read_errors: List[Dict[str, str]] = []
+    events = project_events(root, load_events(root, errors=read_errors))
     selected = sorted([e for e in events if matches(e)], key=_event_order, reverse=True)
-    keys = ("event_id", "scope_id", "recorded_scope_id", "host_id", "profile_id", "work_id", "work_title", "phase", "summary", "primary_path", "verification", "follow_ups", "limitations", "quality_notes")
+    keys = ("event_id", "actor", "source", "occurred_at", "recorded_at", "scope_id", "recorded_scope_id", "host_id", "profile_id", "work_id", "work_title", "phase", "summary", "primary_path", "verification", "follow_ups", "limitations", "quality_notes")
     if read_errors:
         # Missing events could contain a closure or lesson retirement: withhold those conclusions.
         return {"partial": True, "read_errors": read_errors, "matched": len(selected),
@@ -1232,6 +1306,201 @@ def query_events(root: Path, path: str = "", scope_id: str = "", profile_id: str
             "lessons": [{"event_id": e["event_id"], "scope_id": e["scope_id"], "host_id": e.get("host_id", ""), "profile_id": e.get("profile_id", ""), **e["lesson"]} for e in lessons[:limit]]}
 
 
+def _wire_size(value: Any) -> int:
+    # Match the actual ASCII-safe CLI stdout, including its trailing newline.
+    return len(json.dumps(value, ensure_ascii=True, sort_keys=True)) + 1
+
+
+def _query_config_hash(root: Path) -> str:
+    values = [(root / name).read_bytes().hex() if (root / name).exists() else None
+              for name in ("registry.json", "work-items.json")]
+    return hashlib.sha256(_json_bytes(values)).hexdigest()
+
+
+def _query_cursor(state: Dict[str, Any], position: int, prefixes: Sequence[str]) -> str:
+    data = dict(state, n=position, h=prefixes[position])
+    return base64.urlsafe_b64encode(json.dumps(data, separators=(",", ":")).encode("ascii")).decode("ascii")
+
+
+def _read_cursor(value: str) -> Dict[str, Any]:
+    try:
+        if len(value) > 1024:
+            raise ValueError("too long")
+        data = json.loads(base64.b64decode(value, altchars=b"-_", validate=True))
+        if (not isinstance(data, dict) or set(data) != {"v", "q", "c", "n", "h"} or data["v"] != 1
+                or type(data["n"]) is not int or data["n"] < 0
+                or any(not isinstance(data[k], str) or not re.fullmatch(r"[0-9a-f]{64}", data[k])
+                       for k in ("q", "c", "h"))):
+            raise ValueError("invalid fields")
+        return data
+    except (ValueError, TypeError, UnicodeError) as exc:
+        raise JournalError("invalid query cursor; omit --cursor to read a fresh summary") from exc
+
+
+def _compact_item(event: Dict[str, Any], *, card: Optional[Dict[str, Any]] = None,
+                  text_limit: int = 160) -> Dict[str, Any]:
+    item = {k: event.get(k, "") for k in ("event_id", "scope_id", "host_id", "profile_id", "work_id",
+                                         "actor", "source", "occurred_at", "recorded_at", "phase")}
+    item["verification"] = event.get("verification", {}).get("status", "not_run")
+    truncated = []
+    def preview(value, key, length=text_limit):
+        if len(value) > length:
+            truncated.append(key)
+            return value[:length - 1] + "…"
+        return value
+    item["summary"] = preview(event["summary"], "summary")
+    title = card["title"] if card else event.get("work_title", "")
+    if title and title != event["summary"]:
+        item["title"] = preview(title, "title", text_limit // 2)
+    actions = card["follow_ups"] if card else [dict(event_id=event["event_id"], action=a)
+                                                   for a in meaningful_follow_ups(event.get("follow_ups", []))]
+    count_key = "follow_ups_total" if card else "recorded_follow_ups_total"
+    action_key = "follow_up" if card else "recorded_follow_up"
+    item[count_key] = len(actions)
+    if actions:
+        item[action_key] = dict(event_id=actions[0]["event_id"],
+                                action=preview(actions[0]["action"], action_key, text_limit // 2))
+    item["limitations_total"] = len(event.get("limitations", []))
+    item["quality_notes_total"] = len(event.get("quality_notes", []))
+    if card:
+        item["event_count"] = card["event_count"]
+    else:
+        # Delta entries describe new evidence, including closures/retirements.
+        relations = ["resolves_event_ids", "supersedes_event_ids"]
+        if event.get("schema_version") == "1.0":
+            item["schema_version"] = "1.0"
+            relations.append("related_event_ids")
+        for relation in relations:
+            ids = event.get(relation, [])
+            if ids:
+                item[relation] = ids[:2]
+                item[relation + "_total"] = len(ids)
+        if event.get("lesson"):
+            item["lesson"] = {k: event["lesson"][k] for k in ("key", "status")}
+    if truncated:
+        item["truncated_fields"] = truncated
+    return item
+
+
+def compact_query(root: Path, path: str = "", scope_id: str = "", profile_id: str = "", limit: int = 3,
+                  work_id: str = "", host_id: str = "", *, max_chars: int = 6000, cursor: str = "") -> Dict[str, Any]:
+    """Bounded summary or change feed. Cursors are local snapshot checkpoints, not read receipts."""
+    matches, filters = _query_filter(path, scope_id, profile_id, work_id, host_id)
+    if not 1 <= limit <= 50 or not 4096 <= max_chars <= 64000:
+        raise JournalError("limit must be 1..50 and max-chars must be 4096..64000")
+    previous = _read_cursor(cursor) if cursor else None
+    if not (root / "events").is_dir():
+        raise JournalError("journal does not exist; check --root or run init")
+    with journal_lock(root):
+        config_hash = _query_config_hash(root)
+        load_registry(root)  # A broken configuration cannot validate an unchanged checkpoint.
+        errors: List[Dict[str, str]] = []
+        raw = load_events(root, errors=errors)
+        duplicates = {key for key, count in Counter(e["event_id"] for e in raw).items() if count > 1}
+        if duplicates:
+            errors.append({"error": "duplicate event IDs; inspect doctor"})
+            raw = [e for e in raw if e["event_id"] not in duplicates]
+        raw.sort(key=lambda e: (_event_order(e)[1], e["event_id"], e["_path"]))
+        events = project_events(root, raw)
+        if config_hash != _query_config_hash(root):
+            raise JournalError("classification changed during query; retry without advancing the cursor")
+    selected = [e for e in events if matches(e)]
+    if errors:
+        result = {"mode": "partial", "partial": True, "matched": len(selected), "items": [], "cursor": None,
+                  "pending_matched": None, "lessons_matched": None, "legacy_pending": None,
+                  "cards_matched": None,
+                  "read_errors_total": len(errors), "omitted": len(selected),
+                  "warning": "Incomplete evidence; counts are lower bounds. Run doctor."}
+        for event in sorted(selected, key=_event_order, reverse=True)[:limit]:
+            candidate = dict(result, items=result["items"] + [_compact_item(event, text_limit=80)])
+            if _wire_size(candidate) > max_chars:
+                break
+            result = candidate
+        result["omitted"] = len(selected) - len(result["items"])
+        return result
+    groups = {_work_identity(e) for e in selected}
+    selected_ids = {e["event_id"] for e in selected}
+    lesson_id = lambda e: tuple(e.get(k, "") for k in ("scope_id", "host_id", "profile_id")) + (e.get("lesson", {}).get("key", ""),)
+    lesson_ids = {lesson_id(e) for e in selected if e.get("lesson")}
+    def relevant(e):
+        closures = e.get("resolves_event_ids", []) + e.get("supersedes_event_ids", [])
+        if e.get("schema_version") == "1.0":
+            closures += e.get("related_event_ids", [])
+        return (matches(e) or _work_identity(e) in groups
+                or bool(selected_ids.intersection(closures))
+                or (bool(e.get("lesson")) and lesson_id(e) in lesson_ids))
+    prefixes = [hashlib.sha256(b"change-journal-query-v1").hexdigest()]
+    for event in raw:
+        evidence = {k: v for k, v in event.items() if k != "_path"}
+        evidence["_file"] = Path(event["_path"]).relative_to(root).as_posix()
+        prefixes.append(hashlib.sha256(bytes.fromhex(prefixes[-1]) + _json_bytes(evidence)).hexdigest())
+    state = {"v": 1, "q": hashlib.sha256(_json_bytes([str(root.resolve()), filters])).hexdigest(), "c": config_hash}
+    reset = ""
+    if previous:
+        if previous["q"] != state["q"]:
+            reset = "query_changed"
+        elif previous["c"] != config_hash:
+            reset = "classification_changed"
+        elif previous["n"] >= len(prefixes) or previous["h"] != prefixes[previous["n"]]:
+            reset = "history_changed"
+    incremental = previous is not None and not reset
+    start = previous["n"] if incremental else 0
+    if incremental and not any(relevant(e) for e in events[start:]):
+        return {"mode": "unchanged", "partial": False, "cursor": _query_cursor(state, len(events), prefixes)}
+    cards = [c for c in work_cards(events) if _work_identity(c["_events"][-1]) in groups]
+    pending = [e for e in open_continuation_events(events) if matches(e)]
+    result = {"mode": "delta" if incremental else "snapshot", "partial": False, "items": [],
+              "matched": len(selected), "cards_matched": len(cards), "pending_matched": len(pending),
+              "lessons_matched": sum(matches(e) for e in current_lessons(events)),
+              "legacy_pending": sum(matches(e) for e in legacy_continuation_events(events)),
+              "cursor": _query_cursor(state, start if incremental else len(events), prefixes), "omitted": 0}
+    if incremental:
+        result["has_more"] = False
+    if reset:
+        result["reset_reason"] = reset
+    candidates = [(i, e, None) for i, e in enumerate(events[start:], start) if relevant(e)] if incremental else [
+        (i, c["_events"][-1], c) for i, c in enumerate(cards)]
+    position = start
+    for index, event, card in candidates:
+        if len(result["items"]) >= limit:
+            break
+        accepted = False
+        for size in (160, 40):
+            candidate = dict(result, items=result["items"] + [_compact_item(event, card=card, text_limit=size)],
+                             omitted=len(candidates))
+            if incremental:
+                candidate["has_more"] = True
+                candidate["cursor"] = _query_cursor(state, index + 1, prefixes)
+            if _wire_size(candidate) + 64 <= max_chars:
+                result, accepted = candidate, True
+                position = index + 1
+                break
+        if not accepted:
+            if not result["items"]:
+                raise JournalError("item exceeds max-chars; increase the budget or use show EVENT_ID")
+            break
+    result["omitted"] = len(candidates) - len(result["items"])
+    if incremental:
+        result["has_more"] = bool(result["omitted"])
+        # Never acknowledge an omitted matching event. Unrelated trailing facts are safe to skip.
+        result["cursor"] = _query_cursor(state, position if result["has_more"] else len(events), prefixes)
+    return result
+
+
+def show_event(root: Path, event_id: str) -> Dict[str, Any]:
+    event_id = safe_id(event_id, "event_id")
+    if not event_id:
+        raise JournalError("event_id is required")
+    paths = list((root / "events").glob(f"*/*/{event_id}.json"))
+    if len(paths) != 1:
+        raise JournalError("event ID must identify exactly one fact")
+    event = json.loads(paths[0].read_text(encoding="utf-8"))
+    issues = validate_event(event)
+    if issues or event["event_id"] != event_id:
+        raise JournalError("invalid event; inspect doctor")
+    return {"event": event}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", help="Journal root; overrides CHANGE_JOURNAL_ROOT")
@@ -1246,7 +1515,12 @@ def build_parser() -> argparse.ArgumentParser:
     query.add_argument("--profile-id", default="")
     query.add_argument("--work-id", default="")
     query.add_argument("--host-id", default="")
-    query.add_argument("--limit", type=int, default=5)
+    query.add_argument("--limit", type=int, default=3)
+    query.add_argument("--detail", action="store_true", help="Expand the legacy detailed response; not budgeted")
+    query.add_argument("--max-chars", type=int, default=6000, help="Total ASCII JSON stdout budget for compact queries")
+    query.add_argument("--cursor", default="", help="Previous checkpoint from this context and query")
+    show = sub.add_parser("show", help="Read one complete original event")
+    show.add_argument("event_id")
 
     route = sub.add_parser("route")
     route.add_argument("--cwd", default=os.getcwd())
@@ -1306,7 +1580,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         elif args.command == "doctor":
             result = doctor(root)
         elif args.command == "query":
-            result = query_events(root, args.path, args.scope_id, args.profile_id, args.limit, args.work_id, args.host_id)
+            if args.detail and args.cursor:
+                raise JournalError("--cursor requires a compact query; omit --detail")
+            values = (root, args.path, args.scope_id, args.profile_id, args.limit, args.work_id, args.host_id)
+            result = query_events(*values) if args.detail else compact_query(*values, max_chars=args.max_chars, cursor=args.cursor)
+        elif args.command == "show":
+            result = show_event(root, args.event_id)
         elif args.command == "route":
             cwd = safe_path(args.cwd, "cwd")
             paths = [safe_path(path, "changed_path") for path in args.changed_path]

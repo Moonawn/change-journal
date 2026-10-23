@@ -37,7 +37,17 @@ class ReliabilityTests(unittest.TestCase):
         return cj.record_event(self.root, **args)
 
     def ref(self, key="same-key"):
-        return self.root / "idempotency" / (hashlib.sha256(key.encode()).hexdigest() + ".json")
+        return self.root / "idempotency" / (cj.idempotency_hash(key, "codex", "semantic", "host-a", "personal") + ".json")
+
+    def legacy_fact(self, result, key):
+        path = Path(result["event_path"])
+        event = json.loads(path.read_text(encoding="utf-8"))
+        (self.root / "idempotency" / (event["idempotency_key_hash"] + ".json")).unlink()
+        event["idempotency_key_hash"] = hashlib.sha256(key.encode()).hexdigest()
+        event.pop("idempotency_payload_hash", None)
+        path.write_text(json.dumps(event), encoding="utf-8")
+        cj._atomic_write(self.root / "idempotency" / (event["idempotency_key_hash"] + ".json"),
+                         cj._json_bytes({"event_id": event["event_id"]}))
 
     def facts(self):
         return {p.name: p.read_bytes() for p in (self.root / "events").glob("*/*/*.json")}
@@ -53,7 +63,7 @@ class ReliabilityTests(unittest.TestCase):
         before = self.facts()
         self.assertEqual(len(before), 1)
         self.assertTrue(any("missing idempotency index" in i for i in cj.doctor(self.root)["issues"]))
-        result = self.record(idempotency_key="same-key", summary="retry must not rewrite fact")
+        result = self.record(idempotency_key="same-key", work_id="one-task", work_title="Original task")
         self.assertTrue(result["duplicate"])
         self.assertEqual(result["work_title"], "Original task")
         self.assertEqual(before, self.facts())
@@ -132,10 +142,59 @@ class ReliabilityTests(unittest.TestCase):
             self.assertEqual(self.record(idempotency_key=key)["event_id"], first["event_id"])
         self.assertTrue(cj.doctor(self.root)["ok"])
 
+    def test_idempotency_keys_are_isolated_by_producer(self):
+        first = self.record(idempotency_key="shared")
+        for field, value in (("actor", "claude"), ("source", "adapter"),
+                             ("host_id", "host-b"), ("profile_id", "customer")):
+            args = {field: value, "idempotency_key": "shared", "summary": "independent change"}
+            with self.subTest(field=field):
+                other = self.record(**args)
+                self.assertNotEqual(first["event_id"], other["event_id"])
+                self.assertTrue(self.record(**args)["duplicate"])
+        self.assertEqual(len(self.facts()), 5)
+        self.assertTrue(cj.doctor(self.root)["ok"])
+
+    def test_same_key_conflicting_payload_is_visible_and_preserves_facts(self):
+        first = self.record(idempotency_key="shared")
+        before = self.facts()
+        conflicts = [dict(summary="new fact"), dict(phase="active"), dict(verification_refs=["new evidence"]),
+                     dict(changed_paths=["/workspace/another/file"]), dict(follow_ups=["still needs verification"]),
+                     dict(limitations=["not deployed"]), dict(work_id="another-work"), dict(work_title="new title"),
+                     dict(occurred_at="2026-10-01T00:00:00Z"), dict(scope_id="OTHER")]
+        for values in conflicts:
+            with self.subTest(values=values), self.assertRaisesRegex(cj.JournalError, "idempotency conflict.*" + first["event_id"]):
+                self.record(idempotency_key="shared", **values)
+        self.assertEqual(before, self.facts())
+        # Retry transport metadata may change, while the original provenance stays immutable.
+        self.assertEqual(self.record(idempotency_key="shared", session_id="new-session", turn_id="new-turn")["event_id"],
+                         first["event_id"])
+
+    def test_legacy_retry_compares_payload_and_does_not_claim_another_producer(self):
+        original = self.record(idempotency_key="legacy")
+        self.legacy_fact(original, "legacy")
+        before = self.facts()
+        self.assertEqual(self.record(idempotency_key="legacy")["event_id"], original["event_id"])
+        with self.assertRaisesRegex(cj.JournalError, "idempotency conflict"):
+            self.record(idempotency_key="legacy", summary="different")
+        self.assertEqual(before, self.facts())
+        other = self.record(idempotency_key="legacy", actor="claude", summary="different")
+        self.assertNotEqual(other["event_id"], original["event_id"])
+        self.assertEqual(before[Path(original["event_path"]).name], Path(original["event_path"]).read_bytes())
+        self.assertTrue(cj.doctor(self.root)["ok"])
+
+    def test_payload_truncation_does_not_hide_a_conflicting_retry(self):
+        first = self.record(idempotency_key="long-payload", summary="a" * 600 + "first")
+        before = self.facts()
+        self.assertTrue(self.record(idempotency_key="long-payload", summary="a" * 600 + "first")["duplicate"])
+        with self.assertRaisesRegex(cj.JournalError, "idempotency conflict"):
+            self.record(idempotency_key="long-payload", summary="a" * 600 + "second")
+        self.assertEqual(before, self.facts())
+        self.assertNotIn("a" * 600, Path(first["event_path"]).read_text(encoding="utf-8"))
+
     def test_legacy_transformed_key_requires_inspection_instead_of_false_deduplication(self):
         raw = "x" * 310 + "A"
         old_key, _ = cj.safe_text(raw, "idempotency_key", 300)
-        self.record(idempotency_key=old_key)
+        self.legacy_fact(self.record(idempotency_key=old_key), old_key)
         before = self.facts()
         with self.assertRaisesRegex(cj.JournalError, "legacy idempotency key"):
             self.record(idempotency_key=raw)
@@ -342,6 +401,7 @@ class ReliabilityTests(unittest.TestCase):
         self.observe()
         old = self.record(source="codex-hook", actor="observer", phase="observed", verification_status="not_run",
                           idempotency_key="codex-stop:session-a:turn-a")
+        self.legacy_fact(old, "codex-stop:session-a:turn-a")
         before = self.facts()
         fallback = self.stop()
         self.assertEqual([e["event_id"] for e in fallback], [old["event_id"]])

@@ -137,7 +137,7 @@ class PortabilityTests(unittest.TestCase):
         self.assertEqual(result["work_title"], "中文事项")
         self.assertTrue(result["views_updated"])
         query = self.run_script("change_journal.py", "query", "--work-id", "unicode", env=env)
-        self.assertEqual(query["events"][0]["summary"], "完成修改")
+        self.assertEqual(query["items"][0]["summary"], "完成修改")
         payload = dict(profile_id="local", external_event_id="unicode", summary="适配器记录", work_title="中文事项")
         self.run_script("hermes_adapter.py", payload=payload, env=env)
         self.assertEqual(len(cj.load_events(self.root)), 2)

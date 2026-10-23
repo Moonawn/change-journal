@@ -59,7 +59,7 @@ class ChangeJournalTests(unittest.TestCase):
 
     def test_record_is_idempotent_and_lifecycle_is_append_only(self):
         first = self.record(idempotency_key="same-turn")
-        duplicate = self.record(summary="不会覆盖原事件", idempotency_key="same-turn")
+        duplicate = self.record(idempotency_key="same-turn")
         self.assertEqual(first["event_id"], duplicate["event_id"])
         self.assertTrue(duplicate["duplicate"])
 
