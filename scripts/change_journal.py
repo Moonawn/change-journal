@@ -19,8 +19,9 @@ import sys
 import time
 import uuid
 from collections import Counter, defaultdict
+from functools import lru_cache
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 if os.name == "nt":
     import msvcrt
@@ -400,9 +401,10 @@ def _event_order(event: Dict[str, Any]) -> Tuple[dt.datetime, dt.datetime, str]:
     return occurred, recorded, event["event_id"]
 
 
-def _assign_work(root: Path, event: Dict[str, Any], work_id: str, title: str) -> None:
+def _assign_work(root: Path, event: Dict[str, Any], work_id: str, title: str,
+                 read_prior: Optional[Callable[[], List[Dict[str, Any]]]] = None) -> None:
     items = load_work_items(root)
-    prior = project_events(root, load_events(root))
+    prior = project_events(root, read_prior() if read_prior is not None else load_events(root))
     by_id = {e["event_id"]: e for e in prior}
     eligible = [by_id[v] for v in event["resolves_event_ids"] + event["supersedes_event_ids"]
                 if v in by_id and all(by_id[v].get(k, "") == event.get(k, "")
@@ -450,7 +452,8 @@ def _find_event(root: Path, event_id: str) -> Optional[Path]:
     return found[0] if found else None
 
 
-def _idempotent_event(root: Path, key_hash: str) -> Optional[Dict[str, Any]]:
+def _idempotent_event(root: Path, key_hash: str,
+                      read_prior: Optional[Callable[[], List[Dict[str, Any]]]] = None) -> Optional[Dict[str, Any]]:
     """Called under the journal lock; indexes are hints, event facts are authoritative."""
     ref_path = root / "idempotency" / f"{key_hash}.json"
     if ref_path.exists():
@@ -467,7 +470,8 @@ def _idempotent_event(root: Path, key_hash: str) -> Optional[Dict[str, Any]]:
             pass
 
     # The process may have stopped after saving the fact but before its index.
-    matches = [e for e in load_events(root) if e.get("idempotency_key_hash") == key_hash]
+    prior = read_prior() if read_prior is not None else load_events(root)
+    matches = [e for e in prior if e.get("idempotency_key_hash") == key_hash]
     if len(matches) > 1:
         raise JournalError("multiple facts share this idempotency key; inspect doctor before retrying")
     if not matches:
@@ -744,6 +748,14 @@ def record_event(
                                           for v in (idempotency_key.strip(), clean_key)))
 
     with journal_lock(root):
+        # Only reuse facts inside this write lock; retries with a valid index stay scan-free.
+        prior_events = None
+        def read_prior():
+            nonlocal prior_events
+            if prior_events is None:
+                prior_events = load_events(root)
+            return prior_events
+
         event = {
             "schema_version": SCHEMA_VERSION,
             "event_id": _event_id(timestamp),
@@ -786,10 +798,10 @@ def record_event(
                            occurred_at=timestamp if occurred_at else "", input_hash=input_hash)
             payload_hash = hashlib.sha256(_json_bytes(request)).hexdigest()
             event["idempotency_payload_hash"] = payload_hash
-            existing = _idempotent_event(root, key_hash)
+            existing = _idempotent_event(root, key_hash, read_prior)
             if not existing:
                 for index, legacy_hash in enumerate(legacy_hashes):
-                    candidate = _idempotent_event(root, legacy_hash)
+                    candidate = _idempotent_event(root, legacy_hash, read_prior)
                     if candidate and _producer(candidate) == _producer(event):
                         if index:
                             raise JournalError("legacy idempotency key was transformed; inspect the existing fact before choosing a new key")
@@ -807,7 +819,7 @@ def record_event(
                     "warnings": existing.get("quality_notes", []),
                 }
         try:
-            _assign_work(root, event, work_id, work_title)
+            _assign_work(root, event, work_id, work_title, read_prior)
         except (JournalError, OSError, json.JSONDecodeError) as exc:
             # Classification is optional: a broken index must not erase the fact.
             event["work_id"] = work_id or ("work-" + event["event_id"] if work_title else "")
@@ -1261,6 +1273,11 @@ def _query_filter(path: str, scope_id: str, profile_id: str, work_id: str, host_
     profile = safe_id(profile_id, "profile_id") if profile_id else ""
     work = safe_id(work_id, "work_id") if work_id else ""
     host = safe_id(host_id, "host_id") if host_id else ""
+    # Lexical path relationships are stable within one query, including foreign OS paths.
+    @lru_cache(maxsize=None)
+    def path_matches(candidate):
+        return _within(candidate, target) or _within(target, candidate)
+
     def matches(e):
         if scope and e.get("scope_id") != scope:
             return False
@@ -1271,7 +1288,7 @@ def _query_filter(path: str, scope_id: str, profile_id: str, work_id: str, host_
         if host and e.get("host_id") != host:
             return False
         paths = [e.get("primary_path", ""), *e.get("changed_paths", [])]
-        return not target or any(p and (_within(p, target) or _within(target, p)) for p in paths)
+        return not target or any(p and path_matches(p) for p in paths)
     return matches, (path_key(target), scope, profile, work, host)
 
 

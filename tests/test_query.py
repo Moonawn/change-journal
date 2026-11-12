@@ -96,6 +96,21 @@ class QueryTests(unittest.TestCase):
         self.assertLess(cj._wire_size(unchanged), 600)
         self.assertEqual(before, {str(p.relative_to(self.root)): p.read_bytes() for p in self.root.rglob("*") if p.is_file()})
 
+    def test_path_reuse_stays_within_query_and_does_not_cache_event_identity(self):
+        matches, _ = cj._query_filter("C:/Projects/Demo", "PROJECT", "personal", "", "host-a")
+        event = dict(scope_id="PROJECT", host_id="host-a", profile_id="personal",
+                     primary_path=r"c:\PROJECTS\DEMO\a.txt", changed_paths=[r"c:\PROJECTS\DEMO\a.txt"])
+        with mock.patch.object(cj, "_within", wraps=cj._within) as compare:
+            self.assertTrue(matches(event))
+            comparisons = compare.call_count
+            self.assertTrue(matches(event))
+            self.assertEqual(compare.call_count, comparisons)
+            self.assertFalse(matches(dict(event, profile_id="company")))
+        other, _ = cj._query_filter("D:/Projects/Demo", "PROJECT", "personal", "", "host-a")
+        self.assertFalse(other(event))
+        event.update(primary_path="C:/Projects/Demolition/a.txt", changed_paths=[])
+        self.assertFalse(matches(event))
+
     def test_delta_includes_backdated_closure_and_lesson_retirement(self):
         old = self.record(follow_ups=["verify"], lesson_key="check", lesson_trigger="before retry", lesson_check="inspect fact")
         start = self.query()

@@ -52,6 +52,35 @@ class ReliabilityTests(unittest.TestCase):
     def facts(self):
         return {p.name: p.read_bytes() for p in (self.root / "events").glob("*/*/*.json")}
 
+    def test_new_write_reads_history_once_and_indexed_retry_does_not_scan(self):
+        with mock.patch.object(cj, "load_events", wraps=cj.load_events) as scan:
+            first = self.record(idempotency_key="first", work_id="one", work_title="Original title")
+            self.assertEqual(scan.call_count, 1)
+            scan.reset_mock()
+            retry = self.record(idempotency_key="first", work_id="one", work_title="Original title")
+            self.assertEqual(retry["event_id"], first["event_id"])
+            self.assertEqual(scan.call_count, 0)
+            scan.reset_mock()
+            second = self.record(idempotency_key="second", work_id="one")
+            self.assertEqual(second["work_title"], "Original title")
+            self.assertEqual(scan.call_count, 1)
+        self.assertEqual(len(self.facts()), 2)
+
+    def test_write_snapshot_does_not_outlive_a_request_or_hide_corrupt_evidence(self):
+        first = self.record(idempotency_key="first")
+        path = Path(first["event_path"])
+        original = path.read_bytes()
+        path.write_text("{broken", encoding="utf-8")
+        with self.assertRaisesRegex(cj.JournalError, "cannot read event"):
+            self.record(idempotency_key="second")
+        self.assertEqual(len(self.facts()), 1)
+        path.write_bytes(original)
+        with mock.patch.object(cj, "load_events", wraps=cj.load_events) as scan:
+            self.record(idempotency_key="second")
+            self.assertEqual(scan.call_count, 1)
+        self.assertEqual(len(self.facts()), 2)
+        self.assertTrue(cj.doctor(self.root)["ok"])
+
     def test_retry_after_index_write_failure_recovers_original_fact(self):
         write = cj._atomic_write
         def fail_index(path, *args, **kw):
