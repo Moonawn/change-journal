@@ -1487,6 +1487,55 @@ def compact_query(root: Path, path: str = "", scope_id: str = "", profile_id: st
     return result
 
 
+def query_text(result: Dict[str, Any], max_chars: int = 2000) -> str:
+    """Render a bounded, stateless reading view; JSON remains the machine API."""
+    if not 256 <= max_chars <= 64000:
+        raise JournalError("text max-chars must be 256..64000")
+    if result.get("mode") not in {"snapshot", "partial"}:
+        raise JournalError("text output requires a fresh summary; use JSON for cursors")
+    items = result["items"]
+
+    def render(count: int) -> str:
+        omitted = result["omitted"] + len(items) - count
+        lines = [f"{result['mode']}: shown={count} omitted={omitted}"]
+        if result.get("partial"):
+            lines.append("Incomplete evidence: counts are lower bounds; action/lesson state unavailable. Run doctor.")
+        else:
+            lines.append(f"matched_events={result['matched']} open_action_events={result['pending_matched']} "
+                         f"lessons={result['lessons_matched']} legacy_unreviewed={result['legacy_pending']}")
+        identity = None
+        for item in items[:count]:
+            current = tuple(item[k] for k in ("scope_id", "host_id", "profile_id"))
+            if current != identity:
+                lines.append(f"[scope={current[0]} host={current[1]} profile={current[2] or '(none)'}]")
+                identity = current
+            work = f" work={item['work_id']}" if item.get("work_id") else ""
+            lines.append(f"- {item['event_id']} phase={item['phase']} check={item['verification']} "
+                         f"{item['occurred_at']} {item['actor']}/{item['source']}{work}")
+            lines.append("  " + json.dumps(item["summary"], ensure_ascii=False))
+            if item.get("title"):
+                lines.append("  title=" + json.dumps(item["title"], ensure_ascii=False))
+            action = item.get("follow_up") or item.get("recorded_follow_up")
+            if action:
+                label = "open_actions" if "follow_up" in item else "recorded_actions"
+                total = item.get("follow_ups_total", item.get("recorded_follow_ups_total", 0))
+                lines.append(f"  {label}={total}; first=" + json.dumps(action["action"], ensure_ascii=False)
+                             + f" evidence={action['event_id']}")
+            notices = [f"{key}={item[key]}" for key in ("limitations_total", "quality_notes_total") if item.get(key)]
+            if item.get("truncated_fields"):
+                notices.append("truncated=" + ",".join(item["truncated_fields"]))
+            if notices:
+                lines.append("  " + " ".join(notices))
+        lines.append("Event state is not work completion. Use show EVENT_ID for evidence.")
+        return "\n".join(lines) + "\n"
+
+    for count in range(len(items), -1, -1):
+        text = render(count)
+        if len(text) <= max_chars:
+            return text
+    raise JournalError("summary header exceeds max-chars; increase the budget")
+
+
 def show_event(root: Path, event_id: str) -> Dict[str, Any]:
     event_id = safe_id(event_id, "event_id")
     if not event_id:
@@ -1517,7 +1566,8 @@ def build_parser() -> argparse.ArgumentParser:
     query.add_argument("--host-id", default="")
     query.add_argument("--limit", type=int, default=3)
     query.add_argument("--detail", action="store_true", help="Expand the legacy detailed response; not budgeted")
-    query.add_argument("--max-chars", type=int, default=6000, help="Total ASCII JSON stdout budget for compact queries")
+    query.add_argument("--format", choices=("json", "text"), default="json", help="JSON API (default) or UTF-8 reading summary")
+    query.add_argument("--max-chars", type=int, help="Total output character budget: JSON defaults to 6000, text to 2000")
     query.add_argument("--cursor", default="", help="Previous checkpoint from this context and query")
     show = sub.add_parser("show", help="Read one complete original event")
     show.add_argument("event_id")
@@ -1580,10 +1630,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         elif args.command == "doctor":
             result = doctor(root)
         elif args.command == "query":
+            if args.format == "text" and (args.detail or args.cursor):
+                raise JournalError("--detail and --cursor require --format json")
             if args.detail and args.cursor:
                 raise JournalError("--cursor requires a compact query; omit --detail")
             values = (root, args.path, args.scope_id, args.profile_id, args.limit, args.work_id, args.host_id)
-            result = query_events(*values) if args.detail else compact_query(*values, max_chars=args.max_chars, cursor=args.cursor)
+            if args.format == "text":
+                budget = args.max_chars if args.max_chars is not None else 2000
+                if not 256 <= budget <= 64000:
+                    raise JournalError("text max-chars must be 256..64000")
+                result = compact_query(*values, max_chars=64000)
+                output = query_text(result, budget)
+                # Pipes on Windows may use a legacy code page; the reading view is always UTF-8.
+                if hasattr(sys.stdout, "buffer"):
+                    sys.stdout.buffer.write(output.encode("utf-8"))
+                else:
+                    sys.stdout.write(output)
+                return 0
+            result = query_events(*values) if args.detail else compact_query(
+                *values, max_chars=args.max_chars if args.max_chars is not None else 6000, cursor=args.cursor)
         elif args.command == "show":
             result = show_event(root, args.event_id)
         elif args.command == "route":

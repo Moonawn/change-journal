@@ -271,6 +271,72 @@ class QueryTests(unittest.TestCase):
         self.assertEqual(len(cj.load_events(self.root)), 2)
         self.assertTrue(self.cli("doctor")[0]["ok"])
 
+    def text_cli(self, *args, ok=True):
+        proc = subprocess.run([sys.executable, str(SCRIPTS / "change_journal.py"),
+                               "--root", str(self.root), "query", "--format", "text", *args],
+                              capture_output=True, timeout=20,
+                              env=dict(os.environ, PYTHONIOENCODING="ascii"))
+        self.assertEqual(proc.returncode, 0 if ok else 2, proc.stderr)
+        return proc.stdout.decode("utf-8") if ok else json.loads(proc.stderr)
+
+    def test_text_is_utf8_and_keeps_distinct_identities_and_provenance(self):
+        first = self.record(summary="已核实中文😀", work_id="same", profile_id="personal")
+        second = self.record(summary="另一身份", work_id="same", profile_id="company", actor="hermes")
+        text = self.text_cli("--work-id", "same")
+        self.assertIn("已核实中文😀", text)
+        self.assertNotIn("\\u", text)
+        for value in [first["event_id"], second["event_id"], "profile=personal", "profile=company",
+                      "host=host-a", "scope=PROJECT", "hermes/semantic", "phase=verified check=passed"]:
+            self.assertIn(value, text)
+        self.assertNotIn("cursor", text)
+        _, wire = self.cli("query", "--work-id", "same")
+        self.assertLess(len(text), len(wire))
+
+    def test_text_preserves_old_open_action_evidence_and_quality_notices(self):
+        old = self.record(work_id="one", follow_ups=["仍需验证" * 40])
+        latest = self.record(work_id="one", summary="后续进展" * 80,
+                             verification_status="partial", limitations=["尚无部署证据"])
+        text = self.text_cli("--work-id", "one")
+        for value in [old["event_id"], latest["event_id"], "open_actions=1", "open_action_events=1",
+                      "limitations_total=1", "quality_notes_total=1", "truncated=summary",
+                      "phase=verified check=partial", "not work completion"]:
+            self.assertIn(value, text)
+
+    def test_text_budget_omits_whole_cards_without_losing_counts(self):
+        for i in range(6):
+            self.record(summary="😀" * 500, work_id="w" + str(i), work_title="中" * 200,
+                        host_id="h" * 128, profile_id="p" * 128, follow_ups=["检查" * 100])
+        for budget in (256, 1000, 2000):
+            text = self.text_cli("--scope-id", "PROJECT", "--limit", "50", "--max-chars", str(budget))
+            self.assertLessEqual(len(text), budget)
+            shown = sum(line.startswith("- ") for line in text.splitlines())
+            self.assertIn(f"shown={shown} omitted={6-shown}", text)
+            self.assertIn("open_action_events=6", text)
+        self.assertIn("256..64000", self.text_cli("--max-chars", "255", ok=False)["error"])
+
+    def test_text_incomplete_evidence_never_claims_actions_are_closed(self):
+        old = self.record(follow_ups=["verify"])
+        closing = self.record(resolves_event_ids=[old["event_id"]])
+        Path(closing["event_path"]).write_text("{broken", encoding="utf-8")
+        text = self.text_cli("--scope-id", "PROJECT")
+        self.assertTrue(text.startswith("partial:"))
+        self.assertIn("state unavailable", text)
+        self.assertIn("Run doctor", text)
+        self.assertNotIn("open_action_events=0", text)
+
+    def test_text_is_stateless_and_json_cursor_and_evidence_stay_compatible(self):
+        event = self.record(summary="事实不变", follow_ups=["verify"])
+        baseline, _ = self.cli("query", "--scope-id", "PROJECT")
+        before = {str(p): p.read_bytes() for p in self.root.rglob("*") if p.is_file()}
+        self.text_cli("--scope-id", "PROJECT")
+        self.assertEqual(before, {str(p): p.read_bytes() for p in self.root.rglob("*") if p.is_file()})
+        self.assertIn("require --format json", self.text_cli("--cursor", baseline["cursor"], ok=False)["error"])
+        self.assertIn("require --format json", self.text_cli("--detail", ok=False)["error"])
+        unchanged, _ = self.cli("query", "--format", "json", "--scope-id", "PROJECT", "--cursor", baseline["cursor"])
+        self.assertEqual(unchanged["mode"], "unchanged")
+        shown, _ = self.cli("show", event["event_id"])
+        self.assertEqual(shown["event"]["summary"], "事实不变")
+
 
 if __name__ == "__main__":
     unittest.main()

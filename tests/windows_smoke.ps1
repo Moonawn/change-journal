@@ -5,8 +5,10 @@ $journalDir = Join-Path $testRoot ([string][char]0x4E2D + ' space')
 $journalScript = Join-Path $PSScriptRoot '../scripts/change_journal.py'
 $hermesScript = Join-Path $PSScriptRoot '../scripts/hermes_adapter.py'
 $summary = [string][char]0x4E2D + [char]0x6587
+$previousConsoleEncoding = [Console]::OutputEncoding
 
 try {
+    [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
     $record = python "$journalScript" --root "$journalDir" record `
         --actor test --source semantic --phase applied --summary "$summary" `
         --primary-path 'C:/Projects/demo' --changed-path 'C:/Projects/demo/file.txt' `
@@ -14,6 +16,10 @@ try {
     if ($LASTEXITCODE -ne 0 -or -not $record.views_updated) { throw 'PowerShell record failed' }
     $query = python "$journalScript" --root "$journalDir" query --work-id smoke | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0 -or $query.items[0].summary -ne $summary) { throw 'Unicode roundtrip failed' }
+    $text = (python "$journalScript" --root "$journalDir" query --work-id smoke --format text) -join "`n"
+    if ($LASTEXITCODE -ne 0 -or -not $text.Contains($summary) -or -not $text.Contains($record.event_id)) {
+        throw 'UTF-8 text query failed'
+    }
     $unchanged = python "$journalScript" --root "$journalDir" query --work-id smoke --cursor "$($query.cursor)" | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0 -or $unchanged.mode -ne 'unchanged') { throw 'Unchanged query failed' }
     $fact = python "$journalScript" --root "$journalDir" show "$($record.event_id)" | ConvertFrom-Json
@@ -29,7 +35,8 @@ try {
     if ($LASTEXITCODE -ne 0 -or -not $hermes.event_id) { throw 'UTF-8 stdin failed' }
     $health = python "$journalScript" --root "$journalDir" doctor | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0 -or -not $health.ok) { throw 'Journal validation failed' }
-    Write-Output ('PowerShell ' + $PSVersionTable.PSVersion + ': record, isolation, query, cursor, show, render, UTF-8 stdin and doctor passed')
+    Write-Output ('PowerShell ' + $PSVersionTable.PSVersion + ': record, isolation, JSON/text query, cursor, show, render, UTF-8 stdin and doctor passed')
 } finally {
+    [Console]::OutputEncoding = $previousConsoleEncoding
     if (Test-Path -LiteralPath $testRoot) { Remove-Item -LiteralPath $testRoot -Recurse -Force }
 }

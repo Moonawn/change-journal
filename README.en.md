@@ -76,15 +76,15 @@ Multiple agents can query each other's change evidence when they use the same jo
 
 ## Review and continue
 
-For manual review, open `views/00_审阅入口_REVIEW.md` in the journal directory. It shows the 8 most recent work items or standalone records; open a work card for its progress, follow-ups and evidence.
+For manual review, run `python3 scripts/change_journal.py render` to refresh the views, then open `views/00_审阅入口_REVIEW.md` in the journal directory. It shows the 8 most recent work items or standalone records; open a work card for its progress, follow-ups and evidence.
 
-Run the following commands from the Skill repository directory. Replace example paths with your project's actual path. On Windows, use `python` or `py -3` in place of `python3`.
+Examples use repository-relative script paths. Agents should use an absolute script path and preserve the task working directory for Hook correlation. Replace example paths with your project's actual path. On Windows, use `python` or `py -3` in place of `python3`.
 
 ```bash
-python3 scripts/change_journal.py query --path /absolute/project
+python3 scripts/change_journal.py query --path /absolute/project --format text
 ```
 
-By default, queries return at most **3 summary cards**, with the complete JSON output limited to **6,000 characters**. Omitted items are counted. Use the returned event IDs when you need the complete facts.
+This reading mode returns at most **3 cards and 2,000 characters** as UTF-8 text. It retains identity, verification and follow-up evidence, and marks omissions or incomplete evidence. Use event IDs to open complete facts. Recording saves facts first; queries see them immediately without rebuilding all Markdown views.
 
 <details>
 <summary><strong>Expand work items, adjust output limits and query incrementally</strong></summary>
@@ -96,7 +96,7 @@ python3 scripts/change_journal.py render
 python3 scripts/change_journal.py doctor
 ```
 
-By default, queries return at most 3 summary cards and limit the complete JSON output to 6,000 characters, including Unicode escapes and newlines. This is not an exact token budget. Adjust these limits with `--limit` and `--max-chars`. Omitted items are counted; use `show EVENT_ID` for the complete event or `--detail` for the detailed query structure. Detailed mode is not subject to the summary budget.
+Omit `--format text` to keep the compatible JSON API. Text budgets range from 256 to 64,000 characters. JSON queries default to at most 3 summary cards and limit the complete output to 6,000 characters, including Unicode escapes and newlines. This is not an exact token budget. Adjust these limits with `--limit` and `--max-chars`. Omitted items are counted; use `show EVENT_ID` for the complete event or `--detail` for the detailed query structure. Detailed mode is not subject to the summary budget. `--detail` and `--cursor` require JSON; text summaries do not return cursors or acknowledge unread history.
 
 Within the same context, use `query --path /absolute/project --cursor "cursor-from-the-previous-response"` to request incremental updates. When the response has `mode: delta` and `has_more: true`, continue with the returned cursor until all pages have been read. An unchanged result returns `unchanged`. Start a new session without a cursor to obtain fresh summaries. A cursor does not mean that all history has been read, and it does not prove that another agent understands the work item. Backdated events, closed follow-ups, and retired lessons are detected; changes to historical facts or classification reset the summary. The query implementation reads and hashes local files without model calls or an additional cache directory.
 
@@ -115,10 +115,10 @@ python3 scripts/change_journal.py record \
   --changed-path /absolute/project/export.py \
   --work-id export-fix --work-title "Export error fix" \
   --verification-status passed --verification-ref "Relevant tests passed" \
-  --idempotency-key export-fix-verified --render
+  --idempotency-key export-fix-verified
 ```
 
-Windows PowerShell (a backtick continues the line; do not add spaces after it):
+Windows PowerShell (a backtick continues the line; do not add spaces after it). For UTF-8 text captured in a PowerShell 5.1 pipeline, set `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)` first. JSON mode retains ASCII-safe output:
 
 ```powershell
 python scripts/change_journal.py record `
@@ -128,10 +128,12 @@ python scripts/change_journal.py record `
   --changed-path 'C:/Projects/demo/export.py' `
   --work-id export-fix --work-title 'Export error fix' `
   --verification-status passed --verification-ref 'Relevant tests passed' `
-  --idempotency-key export-fix-verified --render
-python scripts/change_journal.py query --path 'C:/Projects/demo'
+  --idempotency-key export-fix-verified
+python scripts/change_journal.py query --path 'C:/Projects/demo' --format text
 python scripts/change_journal.py doctor
 ```
+
+Add `--render` when you also want to refresh review views; retry only `render` if that step fails. Views reflect their last generation; `query/show` read current events directly.
 
 For retries, reuse the same idempotency key and record content. Keys are isolated by `actor/source/host/profile`. Reusing a key with different content raises a conflict; inspect the original event. Use a new key for a genuinely new stage while keeping the same `work-id`.
 

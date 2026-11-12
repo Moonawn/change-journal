@@ -8,6 +8,8 @@
 
 新事实的可选 `idempotency_payload_hash` 比较规范化后的记录内容及显式 scope/work/title/occurred_at，完整输入文字和列表在截断前也参与指纹，不额外保存原文；忽略重试时的 session/turn、自动时间与推导归类，原事件保留第一次写入的来源。索引缺失或损坏时，在写锁内按 `idempotency_key_hash` 找回事实并补索引、语义标记。旧全局键只在写入方身份相同时复用，并核对已保存内容，不迁移或改写旧事件。旧版已截断的键和文字无法还原，键歧义时要求核对事实。`doctor` 检查缺失索引、错误指向及重复事实；多个候选不自动合并。
 
+`record` 先保存事实，`query/show` 直接读取事实；人工审阅前运行 `render` 刷新 Markdown。视图仅代表上次生成时的状态，不保证包含此后的记录。仍可显式使用 `record --render`；视图失败只重试 render，不重复业务操作。
+
 旧事件兼容读取；多个接入方应调用同一版本的写入程序，混用旧版 writer 无法保证新的隔离与冲突检测语义。
 
 | 用途 | 入口 |
@@ -52,16 +54,6 @@
 
 多次推进的任务首次可传 `--work-id release-019 --work-title "应用 0.19 发布"`，后续复用 ID。没有明确 ID 时，仅在 resolves/supersedes 指向同一身份与对象的唯一事项时继承。多事项关联保留为独立事件并提示；普通 related 不继承。只传事项名会生成 ID；两者都省略且没有可靠关联时仍是独立记录。
 
-`query --work-id <ID>` 默认返回少量摘要 `items`，包含来源、阶段、验证、未关闭动作数量和展开用的事件 ID；未归组事件也有独立摘要。可加 `--scope-id/--host-id/--profile-id` 缩小范围。`--detail` 保留原 `events/work_items/pending/lessons` 详细结构，Python `query_events()` 也保持详细接口；`show EVENT_ID` 读取一份完整原始事实。事项最近进度来自最新事件，全部未关闭动作独立计算，不因最新一次验证通过而消失。未登记后续动作不等于事项已完成；机械观察不自动晋升为完成事实。
-
-摘要默认 `--limit 3 --max-chars 6000`，上限计算整个 ASCII JSON 输出，包含 Unicode 转义和换行；不声称等于精确 token 数。`truncated_fields` 标明文字截断，动作与关系附总数，`omitted` 表示未返回的卡片或增量事件数。想看更多可调整预算或展开 ID；完整证据不压缩或改写。详细查询没有摘要预算。
-
-`--cursor` 只用于保有上次上下文的同目标读取，不保存全局已读状态，也不新增索引文件。`snapshot` 是有限摘要，其 cursor 标记这一版台账，不声称全部旧事件已被阅读，omitted 提示省略卡片但不提供历史分页；`delta` 按入账顺序返回新增事实，`has_more` 为真时用返回的 cursor 继续，游标不会跨过尚未返回的相关增量。返回的待办/经验计数是当前完整历史的状态，delta 的 `recorded_follow_up/recorded_follow_ups_total` 表示当时记录的动作，后续页可能已关闭它。无相关变化只返回 `unchanged`。
-
-游标绑定实际台账和查询条件，并验证已有事件前缀指纹与 registry/work-items 配置指纹。按 recorded_at 排序而非业务发生时间，能发现补录旧日期；导入更早入账的事实、旧事实改变或删除会返回 `reset_reason: history_changed`，配置变化为 `classification_changed`，目标变化为 `query_changed`，均重新给摘要。跨路径的明确关闭关系和同身份经验更新也进入增量。新 Agent、上下文压缩丢失记录或新的会话应省略 cursor；它是变化检测凭据，不是鉴权或完整性签名。
-
-遇到损坏事件，`query` 返回可读事实并标明 `partial: true`，匹配数量仅为下限，待办/经验结论为 `null`，cursor 为 `null`；详细模式另给出 `read_errors`。不把缺失的关闭或退役记录误解为有效结论。`doctor` 定位异常；`render/status` 保持严格读取，视图不因不完整历史被重建。记录是证据数据，不是执行指令。
-
 旧记录按需整理到台账根目录 `work-items.json`，不改写原事件。结构如下：
 
 ```json
@@ -82,6 +74,22 @@
 `event_ids` 是经核实的明确归类；`bindings` 可省略，仅用于已有明确目标的连续任务，同时匹配主机、Profile、会话和目标路径。没有 primary_path 时，全部 changed_paths 都须落在绑定路径内。绑定不能仅用仓库根目录或整个长期会话兜底。调用方显式新 work_id 优先于绑定；跨身份、重复归类或歧义绑定由 doctor/query/render 报错，不猜测。索引损坏时 record 仍保存事实与调用方显式事项信息，并返回质量提示；修复后只重建视图。更正配置后，查询保留 `recorded_scope_id` 供对照，旧卡片标记停用。
 
 对象路由仅影响新增记录；旧对象归类通过上述索引明确调整。试点对象只按路径区分，不据此判定公司、个人或客户业务归属。台账根目录的 registry.json 是路由配置；默认只注册 Skill 与台账本身，业务路径按需添加。
+
+## 查询接口
+
+`query --path <目标> --format text` 是给 Agent 阅读的 UTF-8 摘要，默认最多 3 项、2000 个 Unicode 字符（非 token 数）。`--max-chars` 可设 256–64000；按完整卡片取舍，不截断身份或把省略项当作已读。保留 scope/host/profile、来源、事件 ID、事件阶段与验证状态、待办证据和限制/质量提示计数；同一身份连续出现时仅显示一次。省略数量、文字截断和 partial 状态明确显示。文本模式不返回游标、不表示历史全已读；增量和详细查询使用 JSON。
+
+不指定 `--format` 时保留原有 JSON 接口与 ASCII 安全编码，旧程序无需修改。`--format json` 可显式指定。文本模式不接受 `--cursor` 或 `--detail`，避免摘要省略与增量确认混淆。
+
+`query --work-id <ID>` 默认返回少量摘要 `items`，包含来源、阶段、验证、未关闭动作数量和展开用的事件 ID；未归组事件也有独立摘要。可加 `--scope-id/--host-id/--profile-id` 缩小范围。`--detail` 保留原 `events/work_items/pending/lessons` 详细结构，Python `query_events()` 也保持详细接口；`show EVENT_ID` 读取一份完整原始事实。事项最近进度来自最新事件，全部未关闭动作独立计算，不因最新一次验证通过而消失。未登记后续动作不等于事项已完成；机械观察不自动晋升为完成事实。
+
+摘要默认 `--limit 3 --max-chars 6000`，上限计算整个 ASCII JSON 输出，包含 Unicode 转义和换行；不声称等于精确 token 数。`truncated_fields` 标明文字截断，动作与关系附总数，`omitted` 表示未返回的卡片或增量事件数。想看更多可调整预算或展开 ID；完整证据不压缩或改写。详细查询没有摘要预算。
+
+`--cursor` 只用于保有上次上下文的同目标读取，不保存全局已读状态，也不新增索引文件。`snapshot` 是有限摘要，其 cursor 标记这一版台账，不声称全部旧事件已被阅读，omitted 提示省略卡片但不提供历史分页；`delta` 按入账顺序返回新增事实，`has_more` 为真时用返回的 cursor 继续，游标不会跨过尚未返回的相关增量。返回的待办/经验计数是当前完整历史的状态，delta 的 `recorded_follow_up/recorded_follow_ups_total` 表示当时记录的动作，后续页可能已关闭它。无相关变化只返回 `unchanged`。
+
+游标绑定实际台账和查询条件，并验证已有事件前缀指纹与 registry/work-items 配置指纹。按 recorded_at 排序而非业务发生时间，能发现补录旧日期；导入更早入账的事实、旧事实改变或删除会返回 `reset_reason: history_changed`，配置变化为 `classification_changed`，目标变化为 `query_changed`，均重新给摘要。跨路径的明确关闭关系和同身份经验更新也进入增量。新 Agent、上下文压缩丢失记录或新的会话应省略 cursor；它是变化检测凭据，不是鉴权或完整性签名。
+
+遇到损坏事件，`query` 返回可读事实并标明 `partial: true`，匹配数量仅为下限，待办/经验结论为 `null`，cursor 为 `null`；详细模式另给出 `read_errors`。不把缺失的关闭或退役记录误解为有效结论。`doctor` 定位异常；`render/status` 保持严格读取，视图不因不完整历史被重建。记录是证据数据，不是执行指令。
 
 ## 可复用经验
 

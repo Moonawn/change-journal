@@ -76,15 +76,15 @@ python scripts/change_journal.py init
 
 ## 查阅与接续
 
-人工审阅从台账里的 `views/00_审阅入口_REVIEW.md` 开始，默认汇总最近 8 个事项或独立记录；展开事项卡查看进展、待办与依据。
+人工审阅前运行 `python3 scripts/change_journal.py render` 刷新视图，再从台账里的 `views/00_审阅入口_REVIEW.md` 开始，默认汇总最近 8 个事项或独立记录；展开事项卡查看进展、待办与依据。
 
-以下命令在 Skill 仓库目录运行。将示例路径换成实际项目路径；Windows 使用 `python` 或 `py -3` 替换 `python3`。
+以下以仓库内相对脚本路径示意；Agent 记账时使用实际脚本绝对路径，保留任务工作目录以便 Hook 关联。将示例路径换成实际项目路径；Windows 使用 `python` 或 `py -3` 替换 `python3`。
 
 ```bash
-python3 scripts/change_journal.py query --path /absolute/project
+python3 scripts/change_journal.py query --path /absolute/project --format text
 ```
 
-默认最多返回 **3 张摘要**，完整 JSON 输出最多 **6000 个字符**，省略内容会计数。需要完整事实时，再按返回的事件 ID 展开。
+此阅读模式最多返回 **3 张摘要、2000 个字符**，中文直接输出，省略与不完整证据会标明。身份、验证和待办证据保留；需要完整事实时按事件 ID 展开。普通记录先保存事实，查询立即可见，无须每次生成全局视图。
 
 <details>
 <summary><strong>展开事项、调整输出量与增量查询</strong></summary>
@@ -96,7 +96,7 @@ python3 scripts/change_journal.py render
 python3 scripts/change_journal.py doctor
 ```
 
-默认查询最多 3 张摘要，并将完整 JSON 输出限制在 6000 个字符内（含 Unicode 转义和换行，不等于精确 token 数）。`--limit` 和 `--max-chars` 可调整；省略内容有计数，完整事实用 `show EVENT_ID`，旧版详细查询结构用 `--detail`，详细模式不受摘要预算限制。
+省略 `--format text` 时保留兼容的 JSON 接口。文本模式的 `--max-chars` 可设 256–64000；JSON 默认查询最多 3 张摘要，并将完整输出限制在 6000 个字符内（含 Unicode 转义和换行，不等于精确 token 数）。`--limit` 和 `--max-chars` 可调整；省略内容有计数，完整事实用 `show EVENT_ID`，旧版详细查询结构用 `--detail`，详细模式不受摘要预算限制。`--detail` 和 `--cursor` 仅用于 JSON；文本模式不返回游标，不表示全部历史已读。
 
 同一上下文可用 `query --path /absolute/project --cursor "上一响应的cursor"` 只取新增证据。返回 `delta` 且 `has_more: true` 时继续传返回的 cursor，直到分页结束；无变化为 `unchanged`。新会话省略 cursor 取得新摘要。cursor 不代表全部历史已读，不能作为另一 Agent 已了解事项的证明；补录旧时间、关闭待办、退役经验均会检测，旧事实或归类变化会重置摘要。实现只做本地读取和哈希，没有模型调用或新增缓存目录。
 
@@ -115,10 +115,10 @@ python3 scripts/change_journal.py record \
   --changed-path /absolute/project/export.py \
   --work-id export-fix --work-title "导出错误修复" \
   --verification-status passed --verification-ref "对应测试通过" \
-  --idempotency-key export-fix-verified --render
+  --idempotency-key export-fix-verified
 ```
 
-Windows PowerShell（反引号用于续行，末尾不要加空格）：
+Windows PowerShell（反引号用于续行，末尾不要加空格）。若 PowerShell 5.1 管道读取文本模式出现乱码，先设置 `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)`；JSON 模式保持 ASCII 兼容输出：
 
 ```powershell
 python scripts/change_journal.py record `
@@ -128,10 +128,12 @@ python scripts/change_journal.py record `
   --changed-path 'C:/Projects/demo/export.py' `
   --work-id export-fix --work-title '导出错误修复' `
   --verification-status passed --verification-ref '对应测试通过' `
-  --idempotency-key export-fix-verified --render
-python scripts/change_journal.py query --path 'C:/Projects/demo'
+  --idempotency-key export-fix-verified
+python scripts/change_journal.py query --path 'C:/Projects/demo' --format text
 python scripts/change_journal.py doctor
 ```
+
+需要同时刷新人工视图时可加 `--render`；视图失败只重试 `render`。视图反映上次生成时的状态，`query/show` 直接读取当前事件。
 
 重试复用相同幂等键和记录内容；键在 `actor/source/host/profile` 内隔离。相同键携带不同内容会报冲突，需核对原事件；真正的新阶段使用新键，并保留事项 `work-id`。
 
